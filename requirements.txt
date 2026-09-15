@@ -1,0 +1,6 @@
+PyQt6>=6.6
+matplotlib>=3.8
+numpy>=1.26
+pandas>=2.1
+requests>=2.31
+baostock>=0.8.9

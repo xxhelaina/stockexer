@@ -1,0 +1,27 @@
+# Python / IDE
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+
+# Runtime output
+*.log
+ui_*_v2.png
+chartmini*_preview.png
+
+# Downloaded or locally supplied market data
+下载数据/
+hs300_5min_2024_2026/
+qfq/
+K线图日期/
+*.csv
+*.day
+
+# Legacy snapshots and local working documents
+训练软件版本*.py
+分模块完整版.py
+main日线.py
+gui/*日线版.py
+测试.py
+网络提取泸深3005分钟K线.py
+*.docx
