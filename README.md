@@ -15,6 +15,9 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+Windows 也可以直接双击 `start_stocklab.bat`。启动脚本会自动切换到项目目录；
+如果缺少依赖或启动失败，命令窗口会保留错误信息，不会直接闪退。
+
 ## 数据来源
 
 - 在线行情按 `BaoStock → 东方财富 → 新浪 → 腾讯` 自动切换。
