@@ -18,6 +18,7 @@ class MyFigureCanvas(FigureCanvas):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setStyleSheet(self.UNFOCUSED_STYLE)
+        self._drag_x = None
 
     def focusInEvent(self, event):
         self.setStyleSheet(self.FOCUSED_STYLE)
@@ -26,6 +27,11 @@ class MyFigureCanvas(FigureCanvas):
     def focusOutEvent(self, event):
         self.setStyleSheet(self.UNFOCUSED_STYLE)
         super().focusOutEvent(event)
+
+    def resizeEvent(self, event):
+        # 旧背景的像素尺寸与坐标轴位置失效，不能继续用于局部刷新。
+        self.parent_window._cursor_backgrounds.clear()
+        super().resizeEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
         if not self.parent_window._check_training_active():
@@ -46,10 +52,10 @@ class MyFigureCanvas(FigureCanvas):
             self.parent_window._zoom_out()
             event.accept()
         elif key == Qt.Key.Key_Left:
-            self.parent_window._move_cursor_left()
+            (self.parent_window._move_cursor_left if self.parent_window.cursor_mode else self.parent_window._pan_left)()
             event.accept()
         elif key == Qt.Key.Key_Right:
-            self.parent_window._move_cursor_right()
+            (self.parent_window._move_cursor_right if self.parent_window.cursor_mode else self.parent_window._pan_right)()
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -60,6 +66,13 @@ class MyFigureCanvas(FigureCanvas):
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus()
+            coords = self._data_coords(event)
+            if coords is not None and self.parent_window.drawing_mode != 'cursor':
+                self.parent_window.add_drawing_point(*coords)
+                event.accept()
+                return
+            self._drag_x = event.position().x()
             if self._try_move_cursor_from_event(event):
                 event.accept()
                 return
@@ -71,12 +84,47 @@ class MyFigureCanvas(FigureCanvas):
             event.ignore()
             return
 
+        if self._drag_x is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.position().x() - self._drag_x
+            width = self.parent_window.ax_kline.bbox.width / self.device_pixel_ratio
+            count = self.parent_window.display_end_idx - self.parent_window.display_start_idx + 1
+            steps = int(-delta * count / max(1, width))
+            if steps:
+                self._drag_x = event.position().x()
+                self.parent_window._pan(steps)
+            event.accept()
+            return
+
         if self.parent_window.cursor_mode:
             if self._try_move_cursor_from_event(event):
                 event.accept()
                 return
 
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_x = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self._drag_x = None
+        if self.parent_window._is_training_active_silent():
+            self.parent_window.toggle_cursor_mode()
+            event.accept()
+
+    def wheelEvent(self, event):
+        if self.parent_window._is_training_active_silent() and event.angleDelta().y():
+            self.parent_window._zoom_in() if event.angleDelta().y() > 0 else self.parent_window._zoom_out()
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def _data_coords(self, event):
+        ax = self.parent_window.ax_kline
+        pixels = self.mouseEventCoords(event)
+        if not ax.get_visible() or not ax.bbox.contains(*pixels):
+            return None
+        return ax.transData.inverted().transform(pixels)
 
     def _try_move_cursor_from_event(self, event):
         ax = self.parent_window.ax_kline
@@ -90,7 +138,7 @@ class MyFigureCanvas(FigureCanvas):
             if not ax.bbox.contains(x_pixel, y_pixel):
                 return False
             inv = ax.transData.inverted()
-            x_data, _ = inv.transform((x_pixel, y_pixel))
+            x_data, price = inv.transform((x_pixel, y_pixel))
 
             start_idx = self.parent_window.display_start_idx
             end_idx = self.parent_window.display_end_idx
@@ -98,7 +146,7 @@ class MyFigureCanvas(FigureCanvas):
             # 坐标轴范围是 [-0.5, data_len-0.5]。旧判断只接受
             # [0, data_len-1]，会丢掉首尾 K 线各半个柱宽的区域。
             if -0.5 <= x_data <= data_len - 0.5:
-                self.parent_window._move_cursor_to_data_x(x_data, fast=True)
+                self.parent_window._move_cursor_to_data_x(x_data, fast=True, price=float(price))
                 return True
         except Exception:
             pass

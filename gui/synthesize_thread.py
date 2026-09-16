@@ -25,8 +25,8 @@ class SynthesizePeriodThread(QThread):
                 '30min': '30min',
                 '60min': '60min',
                 'D': 'D',
-                'W': 'W',
-                'M': 'M'
+                'W': 'W-FRI',
+                'M': pd.offsets.MonthEnd()
             }
             rule = rule_map.get(self.period_key)
             if not rule:
@@ -39,15 +39,14 @@ class SynthesizePeriodThread(QThread):
                 'Close': 'last',
                 'Volume': 'sum'
             }
-            df_resampled = df.resample(rule).agg(agg_dict)
+            if self.period_key.endswith('min'):
+                df_resampled = df.resample(rule, closed='right', label='right',
+                                           origin='start_day', offset='30min').agg(agg_dict)
+            else:
+                df_resampled = df.resample(rule).agg(agg_dict)
 
             # 删除价格列全为 NaN 的行（例如无交易的周期）
             df_resampled.dropna(subset=['Open', 'High', 'Low', 'Close'], how='any', inplace=True)
-
-            if self.period_key == 'W':
-                df_resampled.index = df_resampled.index + pd.Timedelta(days=4)
-            elif self.period_key == 'M':
-                df_resampled.index = df_resampled.index + pd.offsets.MonthEnd(0)
 
             self.finished.emit(df_resampled, self.period_key)
 

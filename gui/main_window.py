@@ -9,6 +9,7 @@ import re
 from datetime import datetime, date
 from typing import Optional, Dict, List, Any, Tuple
 import logging
+import json
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -16,9 +17,9 @@ from PyQt6.QtWidgets import (
     QPushButton, QDateEdit, QDateTimeEdit, QSpinBox, QTableWidget, QTableWidgetItem,
     QGroupBox, QGridLayout, QMessageBox, QHeaderView, QSizePolicy,
     QComboBox, QFileDialog, QProgressDialog, QDialog, QScrollArea, QFrame,
-    QAbstractItemView, QStackedWidget
+    QAbstractItemView, QStackedWidget, QAbstractSpinBox
 )
-from PyQt6.QtCore import Qt, QDate, QDateTime, QSettings
+from PyQt6.QtCore import Qt, QDate, QDateTime, QSettings, QTimer
 from PyQt6.QtGui import QDoubleValidator, QColor
 
 import matplotlib
@@ -109,6 +110,13 @@ class StockDoubleBlindTrainer(QMainWindow):
         # 光标模式
         self.cursor_mode = False
         self.cursor_abs_idx = -1
+        self._cursor_price = None
+        self.drawing_mode = 'cursor'
+        self.drawings = []
+        self._trend_anchor = None
+        self.session_finished = False
+        self.play_timer = QTimer(self)
+        self.play_timer.timeout.connect(self.next_trading_day)
 
         # 线程
         self.scan_thread: Optional[ScanFolderThread] = None
@@ -160,8 +168,8 @@ class StockDoubleBlindTrainer(QMainWindow):
             QPushButton#primaryBtn:hover, QPushButton#startBtn:hover { background: #FFFFFF; }
             QPushButton#startBtn { min-height: 42px; font-size: 14px; }
             QPushButton#dangerBtn, QPushButton#resetBtn { background: transparent; color: #E16B75; border-color: #63333A; }
-            QPushButton#buyBtn { background: #D94F5C; border-color: #EA6570; color: white; }
-            QPushButton#sellBtn { background: #159A70; border-color: #20B482; color: white; }
+            QPushButton#buyBtn { background: #00B786; border-color: #00C894; color: white; }
+            QPushButton#sellBtn { background: #F52D62; border-color: #FF4676; color: white; }
             QPushButton#nextBtn { background: #E8ECF1; border-color: #E8ECF1; color: #111418; min-height: 38px; }
             QPushButton#periodBtn { min-height: 25px; max-height: 25px; padding: 0 8px; border: none; background: transparent; color: #7F8791; }
             QPushButton#periodBtn:hover { background: #1A2027; color: #DCE1E7; }
@@ -173,6 +181,9 @@ class StockDoubleBlindTrainer(QMainWindow):
             }
             QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QDateTimeEdit:focus { border-color: #68727E; }
             QCheckBox { spacing: 7px; color: #C2C8CF; }
+            QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #46505C; border-radius: 3px; background: #0D1116; }
+            QCheckBox::indicator:checked { background: #00A87B; border-color: #00B786; }
+            QCheckBox::indicator:disabled { background: #14181D; border-color: #252B32; }
             QLabel#mutedLabel { color: #747D87; }
             QLabel#dataBadge { color: #A5ADB7; background: #0D1116; border: 1px solid #252B32; border-radius: 6px; padding: 10px; }
             QLabel#sourceBadge { color: #D8A64B; font-weight: 600; }
@@ -222,6 +233,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         center_row.addStretch(1)
         card = QFrame()
         card.setObjectName('setupCard')
+        card.setMinimumWidth(880)
         card.setMaximumWidth(940)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(24, 21, 24, 22)
@@ -268,26 +280,27 @@ class StockDoubleBlindTrainer(QMainWindow):
         left_main_layout.setSpacing(7)
         main_layout.addLayout(left_main_layout, 1)
         self._init_chart_panel(left_main_layout)
-        self._init_trade_panel(left_main_layout)
-        bottom_layout = QHBoxLayout()
-        self._init_history_panel_new(bottom_layout)
-        left_main_layout.addLayout(bottom_layout)
-        left_main_layout.setStretch(0, 20)
-        left_main_layout.setStretch(1, 0)
-        left_main_layout.setStretch(2, 4)
 
         side = QVBoxLayout()
         side.setSpacing(8)
-        self._init_status_panel(side)
         self.btn_end_session = QPushButton('结束本轮')
         self.btn_end_session.setObjectName('resetBtn')
-        self.btn_end_session.clicked.connect(lambda: self.reset_training(keep_data=True))
+        self.btn_end_session.clicked.connect(self.finish_session)
         side.addWidget(self.btn_end_session)
-        side.addStretch(1)
+        self._init_trade_panel(side)
+        self._init_status_panel(side)
+        self._init_history_panel_new(side)
+        self.btn_new_session = QPushButton('新一轮训练')
+        self.btn_new_session.clicked.connect(lambda: self.reset_training(keep_data=True))
+        side.addWidget(self.btn_new_session)
         side_widget = QWidget()
-        side_widget.setFixedWidth(306)
         side_widget.setLayout(side)
-        main_layout.addWidget(side_widget)
+        self.trading_sidebar = QScrollArea()
+        self.trading_sidebar.setWidgetResizable(True)
+        self.trading_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.trading_sidebar.setFixedWidth(380)
+        self.trading_sidebar.setWidget(side_widget)
+        main_layout.addWidget(self.trading_sidebar)
 
         self.workspace_stack.addWidget(page)
         self.trading_page = page
@@ -317,6 +330,12 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.lbl_cur_date = QLabel('未开始')
         self.lbl_cur_date.setObjectName('timeBadge')
         layout.addWidget(self.lbl_cur_date)
+        self.btn_save_session = QPushButton('保存训练')
+        self.btn_save_session.clicked.connect(self.save_session)
+        layout.addWidget(self.btn_save_session)
+        self.btn_load_session = QPushButton('恢复训练')
+        self.btn_load_session.clicked.connect(self.load_session)
+        layout.addWidget(self.btn_load_session)
         parent_layout.addWidget(top_bar)
 
     def _init_chart_panel(self, parent_layout: QVBoxLayout):
@@ -359,16 +378,43 @@ class StockDoubleBlindTrainer(QMainWindow):
         period_layout.addSpacing(6)
         period_layout.addWidget(self.btn_fenshi)
         period_layout.addStretch()
-        hint_label = QLabel('双击：光标/缩放   滚轮或方向键：缩放/移动   ESC：退出光标')
-        hint_label.setObjectName('mutedLabel')
-        period_layout.addWidget(hint_label)
         chart_layout.addLayout(period_layout)
+        tools = QHBoxLayout()
+        self.indicator_checks = {}
+        for name, checked in [('MA', True), ('成交量', True), ('MACD', False)]:
+            check = QCheckBox(name)
+            check.setChecked(checked)
+            check.toggled.connect(lambda _: self._draw_combined_chart())
+            self.indicator_checks[name] = check
+            tools.addWidget(check)
+        tools.addSpacing(10)
+        self.drawing_buttons = {}
+        for title, mode in [('十字光标', 'cursor'), ('水平线', 'horizontal'), ('趋势线', 'trend')]:
+            button = QPushButton(title)
+            button.setCheckable(True)
+            button.setObjectName('periodBtn')
+            button.clicked.connect(lambda _, m=mode: self.set_drawing_mode(m))
+            tools.addWidget(button)
+            self.drawing_buttons[mode] = button
+        self.drawing_buttons['cursor'].setChecked(True)
+        clear = QPushButton('清除画线')
+        clear.clicked.connect(self.clear_drawings)
+        tools.addWidget(clear)
+        tools.addStretch()
+        shot = QPushButton('截图')
+        shot.clicked.connect(self.export_chart)
+        tools.addWidget(shot)
+        full = QPushButton('全屏')
+        full.clicked.connect(lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen())
+        tools.addWidget(full)
+        chart_layout.addLayout(tools)
         self.period_buttons['D'].setChecked(True)
 
         self.fig = Figure(figsize=(12, 7), dpi=100)
         self.canvas = MyFigureCanvas(self.fig, self)
+        self.canvas.mpl_connect('draw_event', self._on_chart_draw)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.canvas.setMinimumHeight(450)
+        self.canvas.setMinimumHeight(280)
         chart_layout.addWidget(self.canvas)
 
         self.fig.clear()
@@ -382,6 +428,279 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.ax_macd.set_visible(False)
 
         parent_layout.addWidget(chart_group)
+
+    def toggle_playback(self):
+        if self.play_timer.isActive():
+            self.stop_playback()
+        elif self._is_training_active_silent() and not self.session_finished:
+            self.update_play_speed()
+            self.play_timer.start()
+            self.btn_play.setText('暂停回放')
+
+    def stop_playback(self):
+        self.play_timer.stop()
+        self.btn_play.setText('自动回放')
+
+    def update_play_speed(self, *_):
+        self.play_timer.setInterval([500, 1000, 2000][self.play_speed.currentIndex()])
+
+    def finish_session(self):
+        if not self._is_training_active_silent():
+            return
+        self.stop_playback()
+        self.session_finished = True
+        self._set_trade_buttons_enabled(False)
+        self.btn_play.setEnabled(False)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('本轮训练结算')
+        layout = QVBoxLayout(dialog)
+        equity = self.simulator.get_total_asset(self._get_current_price())
+        initial = float(self.simulator.initial_capital)
+        layout.addWidget(QLabel(
+            f'总权益：¥ {equity:,.2f}\n总收益：{equity - initial:+,.2f} '
+            f'({(equity / initial - 1) * 100:+.2f}%)\n'
+            f'已实现：{self.simulator.get_realized_pnl():+,.2f}\n'
+            f'未实现：{self.simulator.get_unrealized_pnl(self._get_current_price()):+,.2f}\n'
+            f'成交笔数：{len(self.simulator.trade_history)}\n'
+            '结算按当前市价估值，不自动平仓。'))
+        save = QPushButton('保存本轮训练')
+        save.clicked.connect(self.save_session)
+        layout.addWidget(save)
+        close = QPushButton('返回查看图表')
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def set_drawing_mode(self, mode):
+        self.drawing_mode = mode
+        self._trend_anchor = None
+        for key, button in self.drawing_buttons.items():
+            button.setChecked(key == mode)
+        self.cursor_mode = mode == 'cursor'
+        self._cursor_price = None
+        self._draw_combined_chart()
+
+    def add_drawing_point(self, x_data, price):
+        idx = max(self.display_start_idx, min(self.display_end_idx,
+                  self.display_start_idx + int(np.floor(x_data + .5))))
+        point = [self.stock_data.index[idx].isoformat(), float(price)]
+        if self.drawing_mode == 'horizontal':
+            self.drawings.append({'period': self.current_period, 'type': 'horizontal', 'points': [point]})
+        elif self.drawing_mode == 'trend':
+            if self._trend_anchor is None:
+                self._trend_anchor = point
+                self.statusBar().showMessage('趋势线：请点击第二个端点', 5000)
+                return
+            self.drawings.append({'period': self.current_period, 'type': 'trend',
+                                  'points': [self._trend_anchor, point]})
+            self._trend_anchor = None
+        self._draw_combined_chart()
+
+    def clear_drawings(self):
+        self.drawings = []
+        self._trend_anchor = None
+        self._draw_combined_chart()
+
+    def _draw_annotations(self, start_idx, end_idx):
+        self.trade_markers = []
+        for record in self.simulator.trade_history:
+            label = self._dt_to_period_label(record.date, self.current_period)
+            idx = int(self.stock_data.index.searchsorted(label))
+            if start_idx <= idx <= end_idx:
+                buy = record.action.value == '买入'
+                marker = self.ax_kline.scatter(idx - start_idx, record.price,
+                    marker='^' if buy else 'v', color='#FF6471' if buy else '#00BC8A',
+                    s=65, edgecolors='#FFFFFF', linewidths=.5, zorder=12)
+                self.trade_markers.append(marker)
+        for drawing in self.drawings:
+            if drawing['period'] != self.current_period:
+                continue
+            if drawing['type'] == 'horizontal':
+                self.ax_kline.axhline(drawing['points'][0][1], color='#639CFF', linewidth=1)
+            else:
+                points = drawing['points']
+                xs = [int(self.stock_data.index.searchsorted(pd.Timestamp(p[0]))) - start_idx for p in points]
+                self.ax_kline.plot(xs, [p[1] for p in points], color='#639CFF', linewidth=1.3)
+
+    def export_chart(self):
+        if not self._is_training_active_silent():
+            return
+        path, _ = QFileDialog.getSaveFileName(self, '保存图表截图', 'StockLab.png', 'PNG 图片 (*.png)')
+        if path:
+            try:
+                self.fig.savefig(path, dpi=self.fig.dpi, facecolor=self.fig.get_facecolor())
+                self.statusBar().showMessage('图表截图已保存', 5000)
+            except Exception as error:
+                QMessageBox.warning(self, '保存失败', str(error))
+
+    @staticmethod
+    def _pack_frame(frame):
+        columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        return {'times': [timestamp.isoformat() for timestamp in frame.index],
+                'rows': frame[columns].astype(float).values.tolist()}
+
+    @staticmethod
+    def _unpack_frame(data):
+        frame = pd.DataFrame(data['rows'], columns=['Open', 'High', 'Low', 'Close', 'Volume'],
+                             index=pd.to_datetime(data['times']))
+        if len(frame) < 1 or not frame.index.is_unique or not frame.index.is_monotonic_increasing:
+            raise ValueError('存档行情时间索引错误')
+        if frame.index.hasnans or not np.isfinite(frame.values).all():
+            raise ValueError('存档行情包含无效数值')
+        if (frame[['Open', 'High', 'Low', 'Close']] <= 0).any().any():
+            raise ValueError('存档行情价格必须大于0')
+        if ((frame.High < frame[['Open', 'Close', 'Low']].max(axis=1)) |
+            (frame.Low > frame[['Open', 'Close', 'High']].min(axis=1)) | (frame.Volume < 0)).any():
+            raise ValueError('存档行情OHLC关系错误')
+        return frame
+
+    def save_session(self):
+        if not self._is_training_active_silent():
+            QMessageBox.information(self, '尚未开始', '请先开始训练，再保存进度。')
+            return
+        self.stop_playback()
+        path, _ = QFileDialog.getSaveFileName(self, '保存训练存档', 'StockLab-session.json', 'JSON 存档 (*.json)')
+        if not path:
+            return
+        try:
+            payload = {'version': 1, 'data': self._pack_frame(self.stock_data_raw),
+                'raw': self._pack_frame(self.raw_min_data if self.is_min_data else self.imported_data),
+                'period': self.current_period, 'source_period': self.source_period_key,
+                'name': self.imported_stock_name, 'code': self.imported_stock_code,
+                'current': self.current_date_idx, 'history_end': self.history_end_idx,
+                'cutoff': str(self.current_datetime), 'history_cutoff': str(self.history_end_datetime),
+                'display': [self.display_start_idx, self.display_end_idx],
+                'finished': self.session_finished, 'drawings': self.drawings,
+                'hide_date': self.cb_hide_date.isChecked(), 'hide_stock': self.cb_hide_stock.isChecked(),
+                'indicators': {key: value.isChecked() for key, value in self.indicator_checks.items()},
+                'quantity': self.sb_trade_amount.value(), 'ratio': self.ratio_combo.currentIndex(),
+                'speed': self.play_speed.currentIndex(), 'view_mode': self.view_mode,
+                'simulator': self.simulator.to_snapshot()}
+            with open(path, 'w', encoding='utf-8') as file:
+                json.dump(payload, file, ensure_ascii=False, allow_nan=False)
+            self.statusBar().showMessage('训练已保存，存档包含行情，可在另一台电脑离线恢复', 7000)
+        except Exception as error:
+            QMessageBox.warning(self, '保存失败', str(error))
+
+    def load_session(self):
+        path, _ = QFileDialog.getOpenFileName(self, '恢复训练存档', '', 'JSON 存档 (*.json)')
+        if not path:
+            return
+        try:
+            if os.path.getsize(path) > 100 * 1024 * 1024:
+                raise ValueError('存档超过100MB，请使用较短的行情区间')
+            with open(path, encoding='utf-8') as file:
+                payload = json.load(file)
+            if payload['version'] != 1:
+                raise ValueError('不支持的存档版本')
+            data = self._unpack_frame(payload['data'])
+            raw = self._unpack_frame(payload['raw'])
+            if len(raw) < 3:
+                raise ValueError('存档原始行情不足3根K线')
+            simulator = TradingSimulator.from_snapshot(payload['simulator'])
+            if not (-1 <= payload['history_end'] <= payload['current'] < len(data)):
+                raise ValueError('存档进度超出行情范围')
+            cutoff = pd.Timestamp(payload.get('cutoff', data.index[payload['current']]))
+            history_cutoff = pd.Timestamp(payload.get('history_cutoff', data.index[max(0, payload['history_end'])]))
+            if pd.isna(cutoff) or pd.isna(history_cutoff) or history_cutoff > cutoff:
+                raise ValueError('存档时间边界错误')
+            left, right = payload['display']
+            if not (0 <= left <= right <= payload['current']):
+                raise ValueError('存档图表范围错误')
+            if payload['period'] not in self.period_buttons or payload['source_period'] not in self.period_buttons:
+                raise ValueError('存档周期错误')
+            if payload['code'] != simulator.current_stock:
+                raise ValueError('存档股票不一致')
+            for key in ('finished', 'hide_date', 'hide_stock'):
+                if not isinstance(payload[key], bool):
+                    raise ValueError('存档状态格式错误')
+            if not isinstance(payload['indicators'], dict) or any(
+                    not isinstance(payload['indicators'].get(key), bool) for key in self.indicator_checks):
+                raise ValueError('存档指标配置错误')
+            if not 1 <= payload.get('quantity', 100) <= 1000000 or not 0 <= payload.get('ratio', 0) < 5:
+                raise ValueError('存档数量/仓位错误')
+            if payload.get('speed', 1) not in (0, 1, 2) or payload.get('view_mode', 'kline') not in ('kline', 'fenshi'):
+                raise ValueError('存档回放参数错误')
+            if any(record.date > cutoff for record in simulator.trade_history):
+                raise ValueError('存档成交超出了当前已揭示的行情')
+            for drawing in payload['drawings']:
+                if drawing['period'] not in self.period_buttons or drawing['type'] not in ('horizontal', 'trend'):
+                    raise ValueError('存档画线类型错误')
+                if len(drawing['points']) != (1 if drawing['type'] == 'horizontal' else 2):
+                    raise ValueError('存档画线端点错误')
+                for timestamp, price in drawing['points']:
+                    pd.Timestamp(timestamp)
+                    if not np.isfinite(float(price)):
+                        raise ValueError('存档画线价格错误')
+            if self._is_training_active_silent():
+                reply = QMessageBox.question(self, '恢复训练', '恢复存档会替换当前训练，是否继续？')
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            if any(thread is not None and thread.isRunning() for thread in
+                   (self.precompute_thread, self.synth_thread, self.scan_thread)):
+                raise ValueError('请等待当前数据处理完成后恢复')
+            self.stop_playback()
+            self._exit_fenshi_mode()
+            self.stock_data_raw = data
+            self.imported_data = raw
+            self.source_period_key = payload['source_period']
+            self.is_min_data = self.source_period_key.endswith('min')
+            self.raw_min_data = raw if self.is_min_data else None
+            self.period_data_cache = {self.source_period_key: raw, payload['period']: data}
+            self.current_period = payload['period']
+            self.imported_stock_name = payload['name']
+            self.imported_stock_code = payload['code']
+            self.simulator = simulator
+            self.le_initial_capital.setText(str(simulator.initial_capital))
+            self.le_fee_rate.setText(str(simulator.fee_rate))
+            self.cb_t0.setChecked(simulator.allow_t0)
+            self.cb_hide_date.setChecked(payload['hide_date'])
+            self.cb_hide_stock.setChecked(payload['hide_stock'])
+            self._restore_payload = payload
+            self._precompute_indicators_async()
+        except Exception as error:
+            QMessageBox.warning(self, '恢复失败', str(error))
+
+    def _complete_restore(self, payload):
+        self.current_date_idx = payload['current']
+        self.history_end_idx = payload['history_end']
+        self.next_idx = self.current_date_idx + 1
+        self.current_date = pd.Timestamp(payload.get('cutoff', self.trading_days[self.current_date_idx]))
+        self.current_datetime = self.current_date
+        self.history_end_datetime = pd.Timestamp(payload.get('history_cutoff', self.trading_days[max(0, self.history_end_idx)]))
+        self._apply_revealed_aggregate(self.current_datetime)
+        self.display_start_idx, self.display_end_idx = payload['display']
+        self.session_finished = payload['finished']
+        self.drawings = payload['drawings']
+        self.cursor_mode = True
+        self.cursor_abs_idx = self.current_date_idx
+        self._cursor_price = None
+        self.drawing_mode = 'cursor'
+        self._trend_anchor = None
+        for mode, button in self.drawing_buttons.items():
+            button.setChecked(mode == 'cursor')
+        self.sb_trade_amount.setValue(payload.get('quantity', 100))
+        self.ratio_combo.setCurrentIndex(payload.get('ratio', 0))
+        self.play_speed.setCurrentIndex(payload.get('speed', 1))
+        self._reset_collections()
+        self._set_checked_period(self.current_period)
+        self._update_fenshi_button_state()
+        if payload.get('view_mode') == 'fenshi' and self.btn_fenshi.isEnabled():
+            self.view_mode = 'fenshi'
+            self.btn_fenshi.setChecked(True)
+            self._clamp_display_to_day()
+        for key, check in self.indicator_checks.items():
+            check.blockSignals(True)
+            check.setChecked(payload['indicators'].get(key, False))
+            check.blockSignals(False)
+        self._update_data_label('训练存档', self.imported_stock_name, self.imported_stock_code, self.imported_data)
+        self._update_status_ui()
+        self._update_trade_history()
+        self._set_session_mode(True)
+        self._update_trade_buttons_state()
+        self._draw_combined_chart()
+        self.lbl_source_status.setText('● 已恢复离线存档')
+        self.statusBar().showMessage('训练进度、持仓、行情和画线已恢复', 6000)
 
     def _init_right_panel(self, main_layout: QHBoxLayout):
         scroll = QScrollArea()
@@ -408,6 +727,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         base_grid = QGridLayout(base_group)
         base_grid.addWidget(QLabel("初始资金："), 0, 0)
         self.le_initial_capital = QLineEdit(str(self.saved_initial_capital))
+        self.le_initial_capital.setMinimumWidth(120)
         self.le_initial_capital.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.le_initial_capital.setValidator(QDoubleValidator(0, 1e9, 2))
         base_grid.addWidget(self.le_initial_capital, 0, 1)
@@ -415,6 +735,7 @@ class StockDoubleBlindTrainer(QMainWindow):
 
         base_grid.addWidget(QLabel("费率："), 1, 0)
         self.le_fee_rate = QLineEdit(str(self.saved_fee_rate))
+        self.le_fee_rate.setMinimumWidth(120)
         self.le_fee_rate.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.le_fee_rate.setValidator(QDoubleValidator(0, 1, 4))
         base_grid.addWidget(self.le_fee_rate, 1, 1)
@@ -528,8 +849,9 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.cb_hide_stock.setChecked(self.saved_hide_stock)
         self.cb_t0 = QCheckBox("允许T+0")
         self.cb_t0.setChecked(self.saved_t0)
-        self.cb_short = QCheckBox("允许卖空")
-        self.cb_short.setChecked(self.saved_short)
+        self.cb_short = QCheckBox("允许卖空（暂不支持）")
+        self.cb_short.setChecked(False)
+        self.cb_short.setEnabled(False)
 
         rule_layout.addWidget(self.cb_hide_date)
         rule_layout.addWidget(self.cb_hide_stock)
@@ -547,15 +869,47 @@ class StockDoubleBlindTrainer(QMainWindow):
         parent_layout.addLayout(btn_layout)
 
     def _init_status_panel(self, parent_layout: QVBoxLayout):
-        status_group = QGroupBox("账户概览")
+        status_group = QWidget()
         self.status_group = status_group
         outer = QVBoxLayout(status_group)
-        equity_caption = QLabel("总权益")
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(10)
+        holdings = QFrame()
+        holdings.setObjectName('chartCard')
+        holding_layout = QVBoxLayout(holdings)
+        holding_layout.setContentsMargins(16, 14, 16, 14)
+        title = QLabel('持仓概览')
+        title.setObjectName('sectionTitle')
+        holding_layout.addWidget(title)
+        grid = QGridLayout()
+        grid.setVerticalSpacing(10)
+        for row, captions in enumerate([('数量', '成本'), ('市价', '浮动盈亏')]):
+            for column, caption in enumerate(captions):
+                label = QLabel(caption)
+                label.setObjectName('mutedLabel')
+                grid.addWidget(label, row * 2, column)
+        self.lbl_cur_hold = QLabel('0 股')
+        self.lbl_avg_cost = QLabel('--')
+        self.lbl_market_price = QLabel('--')
+        self.lbl_unrealized = QLabel('0.00 元')
+        for label, row, column in [(self.lbl_cur_hold, 1, 0), (self.lbl_avg_cost, 1, 1),
+                                  (self.lbl_market_price, 3, 0), (self.lbl_unrealized, 3, 1)]:
+            label.setObjectName('metricValue')
+            grid.addWidget(label, row, column)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        holding_layout.addLayout(grid)
+        outer.addWidget(holdings)
+        account = QFrame()
+        account.setObjectName('chartCard')
+        account_layout = QVBoxLayout(account)
+        account_layout.setContentsMargins(16, 14, 16, 14)
+        equity_caption = QLabel('总权益')
         equity_caption.setObjectName('mutedLabel')
-        outer.addWidget(equity_caption)
+        account_layout.addWidget(equity_caption)
         self.lbl_total_asset = QLabel("¥ 0.00")
         self.lbl_total_asset.setObjectName('metricHero')
-        outer.addWidget(self.lbl_total_asset)
+        account_layout.addWidget(self.lbl_total_asset)
 
         status_layout = QGridLayout()
         status_layout.setHorizontalSpacing(12)
@@ -565,108 +919,87 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.lbl_cur_cash.setObjectName('metricValue')
         status_layout.addWidget(self.lbl_cur_cash, 0, 1)
 
-        status_layout.addWidget(QLabel("持仓数量"), 1, 0)
-        self.lbl_cur_hold = QLabel("0 股")
-        self.lbl_cur_hold.setObjectName('metricValue')
-        status_layout.addWidget(self.lbl_cur_hold, 1, 1)
-
-        status_layout.addWidget(QLabel("持仓成本"), 2, 0)
-        self.lbl_avg_cost = QLabel("--")
-        self.lbl_avg_cost.setObjectName('metricValue')
-        status_layout.addWidget(self.lbl_avg_cost, 2, 1)
-
-        status_layout.addWidget(QLabel("当前市价"), 3, 0)
-        self.lbl_market_price = QLabel("--")
-        self.lbl_market_price.setObjectName('metricValue')
-        status_layout.addWidget(self.lbl_market_price, 3, 1)
-
-        status_layout.addWidget(QLabel("浮动盈亏"), 4, 0)
-        self.lbl_unrealized = QLabel("0.00 元")
-        self.lbl_unrealized.setObjectName('metricValue')
-        status_layout.addWidget(self.lbl_unrealized, 4, 1)
-
-        status_layout.addWidget(QLabel("已实现盈亏"), 5, 0)
+        status_layout.addWidget(QLabel("已实现盈亏"), 1, 0)
         self.lbl_realized = QLabel("0.00 元")
         self.lbl_realized.setObjectName('metricValue')
-        status_layout.addWidget(self.lbl_realized, 5, 1)
+        status_layout.addWidget(self.lbl_realized, 1, 1)
 
-        status_layout.addWidget(QLabel("总收益"), 6, 0)
+        status_layout.addWidget(QLabel("总收益"), 2, 0)
         self.lbl_profit_loss = QLabel("0.00 元  (0.00%)")
         self.lbl_profit_loss.setObjectName('metricValue')
-        status_layout.addWidget(self.lbl_profit_loss, 6, 1)
+        status_layout.addWidget(self.lbl_profit_loss, 2, 1)
 
         status_layout.setColumnStretch(1, 1)
-        outer.addLayout(status_layout)
+        account_layout.addLayout(status_layout)
+        outer.addWidget(account)
         parent_layout.addWidget(status_group)
 
     def _init_trade_panel(self, parent_layout: QVBoxLayout):
         trade_group = QFrame()
         trade_group.setObjectName('tradeBar')
-        trade_group.setFixedHeight(66)
-        trade_layout = QHBoxLayout(trade_group)
-        trade_layout.setContentsMargins(12, 9, 12, 9)
-        trade_layout.setSpacing(7)
+        trade_layout = QVBoxLayout(trade_group)
+        trade_layout.setContentsMargins(12, 12, 12, 12)
+        trade_layout.setSpacing(10)
+        buttons = QHBoxLayout()
+        self.btn_next = QPushButton('下一根 →')
+        self.btn_next.setShortcut('F10')
+        self.btn_next.clicked.connect(self.next_trading_day)
+        buttons.addWidget(self.btn_next)
+        self.btn_buy = QPushButton('买入')
+        self.btn_buy.setObjectName('buyBtn')
+        self.btn_buy.setShortcut('F8')
+        self.btn_buy.clicked.connect(self._on_buy_clicked)
+        buttons.addWidget(self.btn_buy)
+        self.btn_sell = QPushButton('卖出')
+        self.btn_sell.setObjectName('sellBtn')
+        self.btn_sell.setShortcut('F9')
+        self.btn_sell.clicked.connect(self._on_sell_clicked)
+        buttons.addWidget(self.btn_sell)
+        trade_layout.addLayout(buttons)
 
-        title = QLabel("回放控制")
-        title.setStyleSheet("font-weight: 700; color: #F8FAFC;")
-        trade_layout.addWidget(title)
-        trade_layout.addSpacing(5)
+        price_row = QHBoxLayout()
+        price_row.addWidget(QLabel('成交价'))
         self.le_trade_price = QLineEdit()
-        self.le_trade_price.setPlaceholderText('成交价')
         self.le_trade_price.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.le_trade_price.setValidator(QDoubleValidator(0, 10000, 2))
-        self.le_trade_price.setFixedWidth(74)
-        trade_layout.addWidget(self.le_trade_price)
-        self.btn_buy = QPushButton("买入")
-        self.btn_buy.setObjectName("buyBtn")
-        self.btn_buy.setFixedWidth(64)
-        self.btn_buy.setShortcut("F8")
-        self.btn_buy.setToolTip("按当前价格买入（F8）")
-        self.btn_buy.clicked.connect(self._on_buy_clicked)
-        trade_layout.addWidget(self.btn_buy)
-        self.btn_sell = QPushButton("卖出")
-        self.btn_sell.setObjectName("sellBtn")
-        self.btn_sell.setFixedWidth(64)
-        self.btn_sell.setShortcut("F9")
-        self.btn_sell.setToolTip("卖出当前持仓（F9）")
-        self.btn_sell.clicked.connect(self._on_sell_clicked)
-        trade_layout.addWidget(self.btn_sell)
-
-        trade_layout.addSpacing(5)
+        self.le_trade_price.setToolTip('仅接受当前已揭示K线最高/最低价范围内的模拟成交价')
+        price_row.addWidget(self.le_trade_price, 1)
+        trade_layout.addLayout(price_row)
+        trade_layout.addWidget(QLabel('数量（股） / 仓位'))
+        quantity = QHBoxLayout()
         self.btn_qty_minus = QPushButton("−")
         self.btn_qty_minus.setObjectName('stepBtn')
         self.btn_qty_minus.clicked.connect(lambda: self._adjust_trade_amount(-100))
-        trade_layout.addWidget(self.btn_qty_minus)
+        quantity.addWidget(self.btn_qty_minus)
         self.sb_trade_amount = QSpinBox()
         self.sb_trade_amount.setRange(1, 1000000)
+        self.sb_trade_amount.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.sb_trade_amount.setValue(100)
         self.sb_trade_amount.setSingleStep(100)
-        self.sb_trade_amount.setFixedWidth(76)
-        trade_layout.addWidget(self.sb_trade_amount)
+        self.sb_trade_amount.setMinimumWidth(80)
+        quantity.addWidget(self.sb_trade_amount, 1)
         self.btn_qty_plus = QPushButton("+")
         self.btn_qty_plus.setObjectName('stepBtn')
         self.btn_qty_plus.clicked.connect(lambda: self._adjust_trade_amount(100))
-        trade_layout.addWidget(self.btn_qty_plus)
-
+        quantity.addWidget(self.btn_qty_plus)
         self.ratio_combo = QComboBox()
         self.ratio_combo.addItems(["手动", "全仓", "1/2仓", "1/3仓", "1/4仓"])
         self.ratio_combo.setCurrentIndex(0)
-        self.ratio_combo.setFixedWidth(72)
-        trade_layout.addWidget(self.ratio_combo)
-
+        quantity.addWidget(self.ratio_combo)
+        trade_layout.addLayout(quantity)
         self.lbl_control_position = QLabel("持仓 0 股")
         self.lbl_control_position.setObjectName('mutedLabel')
         trade_layout.addWidget(self.lbl_control_position)
-        trade_layout.addStretch()
-
-        self.btn_next = QPushButton("下一根K线 →")
-        self.btn_next.setObjectName("nextBtn")
-        self.btn_next.setFixedWidth(124)
-        self.btn_next.setShortcut("F10")
-        self.btn_next.setToolTip("推进一根K线（F10）")
-        self.btn_next.clicked.connect(self.next_trading_day)
-        trade_layout.addWidget(self.btn_next)
-
+        replay = QHBoxLayout()
+        self.btn_play = QPushButton('自动回放')
+        self.btn_play.clicked.connect(self.toggle_playback)
+        replay.addWidget(self.btn_play)
+        self.play_speed = QComboBox()
+        self.play_speed.addItems(['0.5秒/根', '1秒/根', '2秒/根'])
+        self.play_speed.setCurrentIndex(1)
+        self.play_speed.currentIndexChanged.connect(self.update_play_speed)
+        replay.addWidget(self.play_speed)
+        trade_layout.addLayout(replay)
         parent_layout.addWidget(trade_group)
 
     def _adjust_trade_amount(self, delta: int):
@@ -680,8 +1013,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         history_title = QLabel('成交记录')
         history_title.setObjectName('sectionTitle')
         hist_layout.addWidget(history_title)
-        hist_group.setMinimumWidth(400)
-        hist_group.setMaximumHeight(190)
+        hist_group.setMinimumHeight(210)
 
         self.tbl_trade_hist = QTableWidget()
         self.tbl_trade_hist.setColumnCount(7)
@@ -694,13 +1026,13 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.tbl_trade_hist.verticalHeader().setVisible(False)
 
         header = self.tbl_trade_hist.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column in range(7):
+            self.tbl_trade_hist.setColumnWidth(column, 140 if column == 0 else 70)
         self.tbl_trade_hist.setAlternatingRowColors(True)
 
         hist_layout.addWidget(self.tbl_trade_hist)
         parent_layout.addWidget(hist_group)
-        parent_layout.setStretch(0, 4)
 
     # ----------------- 数据加载 -----------------
     def select_tdx_raw_folder(self):
@@ -764,6 +1096,8 @@ class StockDoubleBlindTrainer(QMainWindow):
             return
 
         try:
+            if hasattr(self, '_user_target_datetime'):
+                del self._user_target_datetime
             df, code, name, period_key = load_market_data_file(file_path)
             self._exit_fenshi_mode()
             self.imported_data = df
@@ -813,6 +1147,8 @@ class StockDoubleBlindTrainer(QMainWindow):
         period_key = dlg.period_key
 
         try:
+            if hasattr(self, '_user_target_datetime'):
+                del self._user_target_datetime
             self._exit_fenshi_mode()
             self.imported_data = df
             self.imported_stock_name = name
@@ -857,6 +1193,10 @@ class StockDoubleBlindTrainer(QMainWindow):
             f"范围：{df.index[0].strftime('%Y-%m-%d %H:%M')} 至 {df.index[-1].strftime('%Y-%m-%d %H:%M')}"
         )
         self.lbl_cur_stock.setText(f"{stock_name}  {stock_code}")
+        for key, button in self.period_buttons.items():
+            if key.endswith('min'):
+                button.setEnabled(self.source_period_key.endswith('min') and
+                                  int(key[:-3]) >= int(self.source_period_key[:-3]))
 
         start_qt = QDateTime(df.index[0].to_pydatetime())
         end_qt = QDateTime(df.index[-1].to_pydatetime())
@@ -912,6 +1252,10 @@ class StockDoubleBlindTrainer(QMainWindow):
     def on_period_button_clicked(self, new_period_key):
         if new_period_key == self.current_period:
             return
+        if any(thread is not None and thread.isRunning() for thread in (self.precompute_thread, self.synth_thread)):
+            self._set_checked_period(self.current_period)
+            return
+        self.stop_playback()
 
         if new_period_key.endswith('min') and self.source_period_key.endswith('min'):
             source_minutes = int(self.source_period_key[:-3])
@@ -923,6 +1267,11 @@ class StockDoubleBlindTrainer(QMainWindow):
                     f"请导入更细周期数据，或在线下载 {target_minutes} 分钟线。")
                 self._set_checked_period(self.current_period)
                 return
+
+        if self._is_training_active_silent():
+            self._pending_period_switch = {
+                'current_dt': self.current_datetime, 'history_end_dt': self.history_end_datetime,
+                'cursor_abs_idx': self.cursor_abs_idx if self.cursor_mode else -1}
 
         # 1分钟周期直接使用原始分钟数据，无需合成
         if new_period_key == '1min':
@@ -950,7 +1299,10 @@ class StockDoubleBlindTrainer(QMainWindow):
             self._switch_period(new_period_key)
             return
 
-        # 需要合成新周期，检查是否有分钟数据
+        # 日线也可以合成周/月线，无需假装必须有1分钟数据。
+        if not self.is_min_data and not new_period_key.endswith('min'):
+            self._synthesize_period_data_async(new_period_key, self.imported_data)
+            return
         if not self.is_min_data:
             QMessageBox.warning(self, "错误", "请先导入1分钟K线数据才能使用分钟级周期！")
             self.period_buttons[self.current_period].setChecked(True)
@@ -998,6 +1350,7 @@ class StockDoubleBlindTrainer(QMainWindow):
             return
 
         self.progress_dialog = QProgressDialog(f"正在合成{period_key}周期数据...", "取消", 0, 0, self)
+        self.progress_dialog.setCancelButton(None)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.synth_thread = SynthesizePeriodThread(min_data_source, period_key)
         self.synth_thread.finished.connect(self.on_synthesize_finished)
@@ -1026,6 +1379,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         if self.stock_data_raw is None:
             return
         self.progress_dialog = QProgressDialog("正在计算技术指标...", "取消", 0, 100, self)
+        self.progress_dialog.setCancelButton(None)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.precompute_thread = PrecomputeIndicatorsThread(self.stock_data_raw)
         self.precompute_thread.progress.connect(self.on_precompute_progress)
@@ -1043,7 +1397,11 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.stock_data = df_with_indicators
         self.trading_days = self.stock_data.index.tolist()
 
-        if self._pending_period_switch is not None:
+        if getattr(self, '_restore_payload', None) is not None:
+            payload = self._restore_payload
+            self._restore_payload = None
+            self._complete_restore(payload)
+        elif self._pending_period_switch is not None:
             old_info = self._pending_period_switch
             self._pending_period_switch = None
             self._finalize_period_switch(old_info)
@@ -1055,6 +1413,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.precompute_thread = None
 
     def on_precompute_error(self, error_msg):
+        self._restore_payload = None
         self.progress_dialog.close()
         QMessageBox.critical(self, "计算错误", f"计算技术指标时出错：{error_msg}")
         self.btn_start.setEnabled(True)   # 错误时重新启用开始按钮
@@ -1062,30 +1421,16 @@ class StockDoubleBlindTrainer(QMainWindow):
 
     def _dt_to_period_label(self, dt: datetime, period_key: str) -> pd.Timestamp:
         ts = pd.Timestamp(dt)
-        if period_key == '1min':
-            return ts.floor('min') + pd.Timedelta(minutes=1)
-        elif period_key == '5min':
-            start = ts.floor('5min')
-            return start + pd.Timedelta(minutes=5)
-        elif period_key == '15min':
-            start = ts.floor('15min')
-            return start + pd.Timedelta(minutes=15)
-        elif period_key == '20min':
-            start = ts.floor('20min')
-            return start + pd.Timedelta(minutes=20)
-        elif period_key == '30min':
-            start = ts.floor('30min')
-            return start + pd.Timedelta(minutes=30)
-        elif period_key == '60min':
-            start = ts.floor('60min')
-            return start + pd.Timedelta(minutes=60)
+        if period_key.endswith('min'):
+            anchor = ts.normalize() + pd.Timedelta(hours=9, minutes=30)
+            return anchor + (ts - anchor).ceil(pd.Timedelta(minutes=int(period_key[:-3])))
         elif period_key == 'D':
             return pd.Timestamp(dt.date())
         elif period_key == 'W':
-            monday = ts - pd.Timedelta(days=ts.weekday())
+            monday = ts.normalize() - pd.Timedelta(days=ts.weekday())
             return monday + pd.Timedelta(days=4)
         elif period_key == 'M':
-            return ts + pd.offsets.MonthEnd(0)
+            return ts.normalize() + pd.offsets.MonthEnd(0)
         else:
             return ts
 
@@ -1112,19 +1457,20 @@ class StockDoubleBlindTrainer(QMainWindow):
         idx_array = np.array(self.trading_days)
         pos = np.searchsorted(idx_array, label_current, side='right') - 1
         self.current_date_idx = int(max(0, pos))
-        self.current_datetime = self.trading_days[self.current_date_idx]
-        self.current_date = self.current_datetime
+        self.current_datetime = current_dt
+        self.current_date = current_dt
+        self._apply_revealed_aggregate(current_dt)
 
         pos = np.searchsorted(idx_array, label_history, side='right') - 1
         self.history_end_idx = int(max(0, pos))
+        if current_dt > history_end_dt and self.history_end_idx >= self.current_date_idx:
+            self.history_end_idx = self.current_date_idx - 1
         if use_exact:
             # 保持与日线起始一致的边界语义：位于历史边界时不可直接交易，
             # 需先点「下一根K线」
             self.history_end_idx = self.current_date_idx
 
         self.next_idx = self.current_date_idx + 1
-        if self.next_idx >= len(self.trading_days):
-            self.next_idx = len(self.trading_days) - 1
 
         self.display_start_idx = max(0, self.current_date_idx - 60)
         self.display_end_idx = self.current_date_idx
@@ -1134,8 +1480,33 @@ class StockDoubleBlindTrainer(QMainWindow):
 
         self._draw_combined_chart()
         self._update_status_ui()
-        self._set_trade_buttons_enabled(True)
-        self._update_data_label("", self.imported_stock_name, self.imported_stock_code, self.stock_data)
+        self._update_trade_buttons_state()
+
+    def _apply_revealed_aggregate(self, cutoff):
+        """切换粗周期时，当前蜡烛仅使用截止已揭示时刻的原始行情。"""
+        raw = self.raw_min_data if self.is_min_data else self.imported_data
+        if raw is None or self.current_date_idx < 0 or self.current_period == self.source_period_key:
+            return
+        boundary = self.stock_data.index[self.current_date_idx]
+        if self.current_period.endswith('min'):
+            start = boundary - pd.Timedelta(minutes=int(self.current_period[:-3]))
+            subset = raw[(raw.index > start) & (raw.index <= pd.Timestamp(cutoff))]
+        else:
+            start = (boundary.normalize() if self.current_period == 'D' else
+                     boundary.normalize() - pd.Timedelta(days=boundary.weekday()) if self.current_period == 'W' else
+                     boundary.normalize().replace(day=1))
+            subset = raw[(raw.index >= start) & (raw.index <= pd.Timestamp(cutoff))]
+        if subset.empty:
+            return
+        row = self.stock_data.index[self.current_date_idx]
+        self.stock_data.loc[row, ['Open', 'High', 'Low', 'Close', 'Volume']] = [
+            subset.Open.iloc[0], subset.High.max(), subset.Low.min(), subset.Close.iloc[-1], subset.Volume.sum()]
+        close = self.stock_data.Close
+        for length in (5, 10, 20, 60):
+            self.stock_data[f'MA{length}'] = close.rolling(length, min_periods=1).mean()
+        self.stock_data['DIF'] = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        self.stock_data['DEA'] = self.stock_data.DIF.ewm(span=9, adjust=False).mean()
+        self.stock_data['MACD'] = 2 * (self.stock_data.DIF - self.stock_data.DEA)
 
     # ----------------- 分时图/K线图视图切换 -----------------
     def toggle_fenshi_view(self):
@@ -1206,10 +1577,11 @@ class StockDoubleBlindTrainer(QMainWindow):
     def _set_session_mode(self, active: bool):
         """在开局页与交易工作区之间切换，避免未开始时出现空图表。"""
         self.workspace_stack.setCurrentWidget(self.trading_page if active else self.setup_page)
-        self.status_group.setTitle("本轮表现")
+        self.btn_save_session.setEnabled(active)
 
     # ----------------- 训练控制 -----------------
     def start_training(self):
+        self.stop_playback()
         # 优先使用已导入的单个文件数据
         if self.imported_data is not None:
             df = self.imported_data
@@ -1279,7 +1651,14 @@ class StockDoubleBlindTrainer(QMainWindow):
                 self._user_exact_target = user_target_datetime
                 self._user_target_pending = True
                 self.period_data_cache.clear()
-                self._synthesize_period_data_async('D', min_data_source=self.raw_min_data)
+                # 按原始分钟周期训练，不能丢弃用户选定的分钟时间。
+                self.stock_data_raw = self.raw_min_data
+                self.current_period = self.source_period_key
+                self.period_data_cache[self.current_period] = self.raw_min_data
+                self._set_checked_period(self.current_period)
+                self._update_fenshi_button_state()
+                self._user_target_pending = False
+                self._precompute_indicators_async()
             else:
                 # 日线数据
                 self.stock_data_raw = df
@@ -1335,8 +1714,13 @@ class StockDoubleBlindTrainer(QMainWindow):
 
             if target_idx is None:
                 raise ValueError(f"设定的时间 {user_target_datetime.strftime('%Y-%m-%d %H:%M')} 不在数据范围内")
+            start_note = ""
             if target_idx == 0:
-                raise ValueError("起始时间不能是数据的第一根K线，没有历史数据用于展示")
+                if len(self.trading_days) < 3:
+                    raise ValueError("至少需要3根K线才能展示历史并开始训练")
+                # 首根没有上下文，自动留出历史窗口，而非让默认起点无法启动。
+                target_idx = min(60, len(self.trading_days) - 1)
+                start_note = f"已自动保留 {target_idx} 根历史K线 · "
 
             self.history_end_idx = target_idx - 1
             self.current_date_idx = self.history_end_idx
@@ -1346,8 +1730,15 @@ class StockDoubleBlindTrainer(QMainWindow):
             self.history_end_datetime = self.trading_days[self.history_end_idx]
 
             self.simulator = TradingSimulator(float(self.le_initial_capital.text()),
-                                              float(self.le_fee_rate.text()))
+                                              float(self.le_fee_rate.text()),
+                                              allow_t0=self.cb_t0.isChecked())
             self.simulator.set_current_stock(self.imported_stock_code)
+            self.session_finished = False
+            self.cursor_mode = True
+            self.cursor_abs_idx = self.current_date_idx
+            self._cursor_price = None
+            self.drawings = []
+            self._trend_anchor = None
 
             self.display_start_idx = max(0, self.current_date_idx - 60)
             self.display_end_idx = self.current_date_idx
@@ -1361,22 +1752,29 @@ class StockDoubleBlindTrainer(QMainWindow):
             self._save_settings()
             self._set_session_mode(True)
             self.statusBar().showMessage(
-                f"复盘已开始 · 首根待交易K线 {self.trading_days[self.next_idx].strftime('%Y-%m-%d %H:%M')}",
+                f"{start_note}复盘已开始 · 首根待交易K线 {self.trading_days[self.next_idx].strftime('%Y-%m-%d %H:%M')}",
                 10000)
 
         except ValueError as e:
+            self.btn_start.setEnabled(True)
             QMessageBox.warning(self, "参数错误", str(e))
         except Exception as e:
             logger.error(f"继续训练时发生错误: {e}", exc_info=True)
             QMessageBox.critical(self, "系统错误", f"继续训练时发生错误：{str(e)}")
 
     def reset_training(self, keep_data: bool = False):
+        self.stop_playback()
         prompt = ("结束当前训练并保留已加载行情吗？"
                   if keep_data else "确定要重置所有训练数据吗？")
         reply = QMessageBox.question(self, "确认重置",
                                      prompt,
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
+            self.session_finished = False
+            self.drawings = []
+            self._trend_anchor = None
+            if hasattr(self, '_user_target_datetime'):
+                del self._user_target_datetime
             # 修复(2026-08-31)：原 plt.close('all') 会销毁画布绑定的 Figure，
             # 重置后再次训练时在死图重绘会原生崩溃(0xC0000409)。
             # 改为安全地清空三个子图（与 clear_imported_data 一致）
@@ -1517,6 +1915,9 @@ class StockDoubleBlindTrainer(QMainWindow):
             target = (target // 100) * 100
             if target < 100 and target > 0:
                 target = 100
+            if target < 100:
+                QMessageBox.warning(self, '资金不足', '当前资金不足以按所选仓位买入一手')
+                return
             self.sb_trade_amount.setValue(target)
         self.buy_stock()
 
@@ -1531,9 +1932,12 @@ class StockDoubleBlindTrainer(QMainWindow):
         ratios = [None, 1.0, 0.5, 1.0/3.0, 0.25]
         ratio = ratios[ratio_index]
         if ratio is not None:
-            hold = self.simulator.get_current_hold()
+            hold = self.simulator.get_sellable_hold(self.current_date)
             target = int(hold * ratio)
             target = (target // 100) * 100
+            if target <= 0:
+                QMessageBox.warning(self, '无法卖出', '当前没有可按所选仓位卖出的持仓（请检查T+1限制）')
+                return
             self.sb_trade_amount.setValue(target)
         self.sell_stock()
 
@@ -1546,6 +1950,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         try:
             price = float(self.le_trade_price.text())
             amount = self.sb_trade_amount.value()
+            self._validate_trade_price(price)
             can_buy, error_msg = self.simulator.can_buy(price, amount)
             if not can_buy:
                 QMessageBox.warning(self, "无法买入", error_msg)
@@ -1556,8 +1961,9 @@ class StockDoubleBlindTrainer(QMainWindow):
                 self._update_trade_history()
                 self.statusBar().showMessage(
                     f"买入成交 · {amount}股 @ {price:.2f} · 手续费 {record.fee:.2f}", 7000)
-        except ValueError:
-            QMessageBox.warning(self, "输入错误", "请输入有效的价格和数量")
+                self._draw_combined_chart()
+        except ValueError as error:
+            QMessageBox.warning(self, "输入错误", str(error))
 
     def sell_stock(self):
         if not self._check_training_active():
@@ -1568,7 +1974,8 @@ class StockDoubleBlindTrainer(QMainWindow):
         try:
             price = float(self.le_trade_price.text())
             amount = self.sb_trade_amount.value()
-            can_sell, error_msg = self.simulator.can_sell(price, amount)
+            self._validate_trade_price(price)
+            can_sell, error_msg = self.simulator.can_sell(price, amount, self.current_date)
             if not can_sell:
                 QMessageBox.warning(self, "无法卖出", error_msg)
                 return
@@ -1578,25 +1985,37 @@ class StockDoubleBlindTrainer(QMainWindow):
                 self._update_trade_history()
                 self.statusBar().showMessage(
                     f"卖出成交 · {amount}股 @ {price:.2f} · 本笔盈亏 {record.realized_pnl:+.2f}", 7000)
-        except ValueError:
-            QMessageBox.warning(self, "输入错误", "请输入有效的价格和数量")
+                self._draw_combined_chart()
+        except ValueError as error:
+            QMessageBox.warning(self, "输入错误", str(error))
+
+    def _validate_trade_price(self, price):
+        if self.session_finished:
+            raise ValueError('本轮训练已结束，请开始新一轮')
+        row = self.stock_data.iloc[self.current_date_idx]
+        if not np.isfinite(price) or not float(row['Low']) - .005 <= price <= float(row['High']) + .005:
+            raise ValueError(f"模拟成交价须在当前K线区间 {row['Low']:.2f}～{row['High']:.2f} 内")
 
     def next_trading_day(self):
         try:
             if not self._check_training_active():
                 return
-            if self.next_idx >= len(self.trading_days):
-                QMessageBox.information(self, "训练结束",
-                                        "已到达数据末尾，训练结束！\n"
-                                        f"最终总资产：{self.simulator.get_total_asset(self._get_current_price()):.2f}元")
-                self._set_trade_buttons_enabled(False)
-                self.btn_start.setEnabled(True)   # 训练结束，重新启用开始按钮
-                self._set_session_mode(False)
+            if self.session_finished:
                 return
+            if self.next_idx >= len(self.trading_days):
+                self.finish_session()
+                return
+            previous_idx = self.current_date_idx
             self.current_date_idx = self.next_idx
             self.next_idx += 1
+            # 上一根粗周期蜡烛现在已完成，恢复完整行情后再计算当前截止点。
+            columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            self.stock_data.loc[self.stock_data.index[previous_idx], columns] = self.stock_data_raw.iloc[previous_idx][columns]
             self.current_date = self.trading_days[self.current_date_idx]
+            if self.current_period in ('D', 'W', 'M'):
+                self.current_date = pd.Timestamp(self.current_date) + pd.Timedelta(hours=15)
             self.current_datetime = self.current_date
+            self._apply_revealed_aggregate(self.current_datetime)
             self._adjust_display_to_include_current()
             self._update_trade_buttons_state()
             self._update_status_ui()
@@ -1611,18 +2030,20 @@ class StockDoubleBlindTrainer(QMainWindow):
         if not self._check_training_active():
             self._set_trade_buttons_enabled(False)
             return
-        trade_enabled = bool(self.current_date_idx > self.history_end_idx)
+        trade_enabled = bool(self.current_date_idx > self.history_end_idx and not self.session_finished)
         self.btn_buy.setEnabled(trade_enabled)
         self.btn_sell.setEnabled(trade_enabled)
         # 修复(2026-08-31)：不切换 le_trade_price 的 enabled/readOnly 状态
         # （PyQt6 6.9.x 在周期切换回调链中触发原生崩溃），改用样式提示
         self.le_trade_price.setStyleSheet(
-            "color: #888888; background-color: #333333;" if not trade_enabled else "")
+            "color: #888888; background-color: #333333;" if not trade_enabled else
+            "color: #E6E9ED; background-color: #0D1116;")
         self.sb_trade_amount.setEnabled(trade_enabled)
         self.btn_qty_minus.setEnabled(trade_enabled)
         self.btn_qty_plus.setEnabled(trade_enabled)
         self.ratio_combo.setEnabled(trade_enabled)
-        self.btn_next.setEnabled(True)
+        self.btn_next.setEnabled(not self.session_finished)
+        self.btn_play.setEnabled(not self.session_finished)
 
     def _adjust_display_to_include_current(self):
         if self.current_date_idx < 0:
@@ -1739,14 +2160,20 @@ class StockDoubleBlindTrainer(QMainWindow):
         else:
             self._update_cursor_overlay()
 
-    def _move_cursor_to_index(self, idx: int, fast: bool = False):
+    def _move_cursor_to_index(self, idx: int, fast: bool = False, price=None):
         if self.stock_data is None:
             return
+        if self.session_finished:
+            self._set_trade_buttons_enabled(False)
+            self.btn_play.setEnabled(False)
+            return
+        self.btn_play.setEnabled(True)
         max_idx = min(len(self.stock_data) - 1, self.current_date_idx)
         if idx < 0 or idx > max_idx:
             return
-        if self.cursor_mode and self.cursor_abs_idx == idx:
+        if self.cursor_mode and self.cursor_abs_idx == idx and self._cursor_price == price:
             return
+        self._cursor_price = price
         self.cursor_mode = True
         self.cursor_abs_idx = idx
         window_changed = self._ensure_cursor_visible()
@@ -1755,7 +2182,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         else:
             self._draw_combined_chart()
 
-    def _move_cursor_to_data_x(self, x_data: float, fast: bool = False):
+    def _move_cursor_to_data_x(self, x_data: float, fast: bool = False, price=None):
         if self.stock_data is None:
             return
         start_idx = self.display_start_idx
@@ -1764,7 +2191,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         local_idx = int(np.floor(x_data + 0.5))
         global_idx = start_idx + local_idx
         global_idx = max(0, min(self.current_date_idx, global_idx))
-        self._move_cursor_to_index(global_idx, fast=fast)
+        self._move_cursor_to_index(global_idx, fast=fast, price=price)
 
     def _ensure_cursor_visible(self):
         old_window = (self.display_start_idx, self.display_end_idx)
@@ -1783,14 +2210,23 @@ class StockDoubleBlindTrainer(QMainWindow):
         """创建动画光标线；这些线不会参与整图 draw，只由 blit 绘制。"""
         self.cursor_artists = {
             'kline_v': self.ax_kline.axvline(0, color='#E2E8F0', linewidth=0.9,
-                                             alpha=0.8, animated=True, zorder=20),
+                                             alpha=0.6, linestyle='--', animated=True, zorder=20),
             'volume_v': self.ax_volume.axvline(0, color='#E2E8F0', linewidth=0.9,
-                                               alpha=0.8, animated=True, zorder=20),
+                                               alpha=0.6, linestyle='--', animated=True, zorder=20),
             'macd_v': self.ax_macd.axvline(0, color='#E2E8F0', linewidth=0.9,
-                                           alpha=0.8, animated=True, zorder=20),
+                                           alpha=0.6, linestyle='--', animated=True, zorder=20),
             'kline_h': self.ax_kline.axhline(0, color='#E2E8F0', linewidth=0.9,
-                                             alpha=0.65, animated=True, zorder=20),
+                                             alpha=0.6, linestyle='--', animated=True, zorder=20),
         }
+        time_axis = self.ax_macd if self.ax_macd.get_visible() else self.ax_volume if self.ax_volume.get_visible() else self.ax_kline
+        self.cursor_time_axis = time_axis
+        label_style = {'facecolor': '#39424E', 'edgecolor': 'none', 'pad': 2}
+        self.cursor_artists['price_label'] = self.ax_kline.text(1, 0, '',
+            transform=self.ax_kline.get_yaxis_transform(), va='center', fontsize=8,
+            color='white', bbox=label_style, animated=True, zorder=25, clip_on=False)
+        self.cursor_artists['time_label'] = time_axis.text(0, -.06, '',
+            transform=time_axis.get_xaxis_transform(), ha='center', va='top', fontsize=8,
+            color='white', bbox=label_style, animated=True, zorder=25, clip_on=False)
         visible = (self.cursor_mode and start_idx <= self.cursor_abs_idx <= end_idx)
         for artist in self.cursor_artists.values():
             artist.set_visible(visible)
@@ -1800,9 +2236,14 @@ class StockDoubleBlindTrainer(QMainWindow):
             self._cursor_backgrounds.clear()
             return
         self._cursor_backgrounds = {
-            ax: self.canvas.copy_from_bbox(ax.bbox)
-            for ax in (self.ax_kline, self.ax_volume, self.ax_macd)
+            self.fig: self.canvas.copy_from_bbox(self.fig.bbox)
         }
+
+    def _on_chart_draw(self, event):
+        """每次整图重绘（包括窗口缩放/DPI变化）重建不含光标的背景。"""
+        self._cache_cursor_backgrounds()
+        if self.cursor_artists and self.stock_data is not None:
+            self._update_cursor_overlay()
 
     def _update_cursor_overlay(self):
         """仅更新四条光标线；常规鼠标移动不重新计算/绘制行情图。"""
@@ -1813,10 +2254,16 @@ class StockDoubleBlindTrainer(QMainWindow):
         visible = (self.cursor_mode and start_idx <= self.cursor_abs_idx <= end_idx)
         if visible:
             local_x = self.cursor_abs_idx - start_idx
-            close_y = float(self.stock_data['Close'].iat[self.cursor_abs_idx])
+            close_y = self._cursor_price if self._cursor_price is not None else float(self.stock_data['Close'].iat[self.cursor_abs_idx])
             for key in ('kline_v', 'volume_v', 'macd_v'):
                 self.cursor_artists[key].set_xdata([local_x, local_x])
             self.cursor_artists['kline_h'].set_ydata([close_y, close_y])
+            self.cursor_artists['price_label'].set_position((1, close_y))
+            self.cursor_artists['price_label'].set_text(f' {close_y:.2f} ')
+            self.cursor_artists['time_label'].set_x(local_x)
+            self.cursor_artists['time_label'].set_text(
+                f'第 {self.cursor_abs_idx + 1} 根' if self.cb_hide_date.isChecked() else
+                self.stock_data.index[self.cursor_abs_idx].strftime('%Y-%m-%d %H:%M'))
             self._update_chart_quote_at(self.cursor_abs_idx)
         elif 0 <= self.current_date_idx < len(self.stock_data):
             self._update_chart_quote_at(self.current_date_idx)
@@ -1824,20 +2271,22 @@ class StockDoubleBlindTrainer(QMainWindow):
             artist.set_visible(visible)
 
         axes_artists = {
-            self.ax_kline: (self.cursor_artists['kline_v'], self.cursor_artists['kline_h']),
-            self.ax_volume: (self.cursor_artists['volume_v'],),
-            self.ax_macd: (self.cursor_artists['macd_v'],),
+            self.ax_kline: [self.cursor_artists['kline_v'], self.cursor_artists['kline_h'], self.cursor_artists['price_label']],
+            self.ax_volume: [self.cursor_artists['volume_v']],
+            self.ax_macd: [self.cursor_artists['macd_v']],
         }
+        axes_artists[self.cursor_time_axis].append(self.cursor_artists['time_label'])
+        background = self._cursor_backgrounds.get(self.fig)
+        if background is None:
+            self._draw_combined_chart()
+            return
+        # 整个画布一次恢复，避免分数像素轴边界残留，以及三次 blit 的中间帧。
+        self.canvas.restore_region(background)
         for ax, artists in axes_artists.items():
-            background = self._cursor_backgrounds.get(ax)
-            if background is None:
-                self._draw_combined_chart()
-                return
-            self.canvas.restore_region(background)
-            if visible:
+            if visible and ax.get_visible():
                 for artist in artists:
                     ax.draw_artist(artist)
-            self.canvas.blit(ax.bbox)
+        self.canvas.blit(self.fig.bbox)
 
     def _update_chart_quote_at(self, idx: int):
         """更新图表顶部的紧凑 OHLCV 行情信息。"""
@@ -1889,7 +2338,7 @@ class StockDoubleBlindTrainer(QMainWindow):
                 end_idx = start_idx
 
             data_len = end_idx - start_idx + 1
-            if data_len < 2:
+            if data_len < 1:
                 return
 
             indicators = self._get_indicators_slice(start_idx, end_idx)
@@ -1897,8 +2346,10 @@ class StockDoubleBlindTrainer(QMainWindow):
                 return
 
             self.ax_kline.set_visible(True)
-            self.ax_volume.set_visible(True)
-            self.ax_macd.set_visible(True)
+            show_volume = self.indicator_checks['成交量'].isChecked()
+            show_macd = self.indicator_checks['MACD'].isChecked()
+            self.ax_volume.set_visible(show_volume)
+            self.ax_macd.set_visible(show_macd)
 
             self.ax_kline.clear()
             self.ax_volume.clear()
@@ -1930,6 +2381,7 @@ class StockDoubleBlindTrainer(QMainWindow):
                 ax.tick_params(axis='x', colors='#888888', labelsize=8)
                 ax.tick_params(axis='y', colors='#888888', labelsize=8)
                 ax.grid(True, alpha=0.22, color='#343A42', linewidth=0.6)
+                ax.yaxis.tick_right()
 
             x = np.arange(data_len)
 
@@ -1937,30 +2389,49 @@ class StockDoubleBlindTrainer(QMainWindow):
                 self._draw_fenshi_lines(x, indicators, start_idx)
             else:
                 self._draw_kline_collections(x, indicators)
-                self._draw_ma_lines(x, indicators)
+                if self.indicator_checks['MA'].isChecked():
+                    self._draw_ma_lines(x, indicators)
 
             low_min = indicators['low'].min()
             high_max = indicators['high'].max()
-            self.ax_kline.set_ylim(low_min * 0.98, high_max * 1.02)
+            price_padding = max((high_max - low_min) * .07, high_max * .001, .01)
+            self.ax_kline.set_ylim(low_min - price_padding, high_max + price_padding)
             if self.ax_kline.lines:
                 self.ax_kline.legend(loc='upper left', fontsize=7, facecolor='#11151A',
                                       edgecolor='#30363D', labelcolor='linecolor')
             self.ax_kline.set_yticks(self.ax_kline.get_yticks()[1:-1])
 
-            self._draw_volume_collections(x, indicators)
-            self._draw_macd_collections(x, indicators)
+            if show_volume:
+                self._draw_volume_collections(x, indicators)
+            if show_macd:
+                self._draw_macd_collections(x, indicators)
+            self._draw_annotations(start_idx, end_idx)
+            current_price = self._get_current_price()
+            self.ax_kline.axhline(current_price, color='#00A88C', linestyle=':', linewidth=.7)
+            self.ax_kline.text(1, current_price, f' {current_price:.2f} ',
+                transform=self.ax_kline.get_yaxis_transform(), color='white', fontsize=8,
+                va='center', bbox={'facecolor': '#008C76', 'edgecolor': 'none'}, clip_on=False)
 
             self.ax_kline.set_xlim(-0.5, data_len - 0.5)
-            self.ax_kline.set_xticks([])
-            self.ax_volume.set_xticks([])
-            self.ax_macd.set_xticks([])
-
-            self.fig.subplots_adjust(left=0.03, right=0.97, top=0.98, bottom=0.02)
+            count = int(show_volume) + int(show_macd)
+            bottom = .075
+            panel_height = .15 if count else 0
+            for axis, enabled in [(self.ax_macd, show_macd), (self.ax_volume, show_volume)]:
+                if enabled:
+                    axis.set_position([.015, bottom, .915, panel_height])
+                    bottom += panel_height + .025
+            self.ax_kline.set_position([.015, bottom, .915, .975 - bottom])
+            tick_axis = self.ax_macd if show_macd else self.ax_volume if show_volume else self.ax_kline
+            ticks = np.unique(np.linspace(0, data_len - 1, min(6, data_len), dtype=int))
+            labels = [f'第 {start_idx + int(i) + 1} 根' if self.cb_hide_date.isChecked()
+                      else self.stock_data.index[start_idx + int(i)].strftime(
+                          '%m-%d %H:%M' if self.current_period.endswith('min') else '%Y-%m-%d') for i in ticks]
+            tick_axis.set_xticks(ticks, labels)
+            for axis in (self.ax_kline, self.ax_volume, self.ax_macd):
+                axis.tick_params(axis='x', labelbottom=axis is tick_axis)
 
             self._create_cursor_artists(start_idx, end_idx)
             self.canvas.draw()
-            self._cache_cursor_backgrounds()
-            self._update_cursor_overlay()
 
         except Exception as e:
             logger.error(f"绘图错误: {e}", exc_info=True)
@@ -2189,7 +2660,8 @@ class StockDoubleBlindTrainer(QMainWindow):
             self.lbl_market_price.setText(f"¥ {current_price:.2f}")
             self.lbl_unrealized.setText(f"{unrealized:+,.2f} 元")
             self.lbl_realized.setText(f"{realized:+,.2f} 元")
-            self.lbl_control_position.setText(f"持仓 {current_hold:,} 股")
+            sellable = self.simulator.get_sellable_hold(self.current_date)
+            self.lbl_control_position.setText(f"持仓 {current_hold:,} 股 · 可卖 {sellable:,} 股")
             initial = float(self.simulator.initial_capital)
             profit = total_asset - initial
             return_pct = profit / initial * 100 if initial else 0.0
@@ -2209,7 +2681,8 @@ class StockDoubleBlindTrainer(QMainWindow):
             # 改用样式提供「历史展示阶段」视觉提示；交易拦截由各交易处理函数的
             # 历史阶段校验（"当前处于历史展示阶段"警告）负责。
             self.le_trade_price.setStyleSheet(
-                "color: #888888; background-color: #333333;" if readonly else "")
+                "color: #888888; background-color: #333333;" if readonly else
+                "color: #E6E9ED; background-color: #0D1116;")
 
     def _update_trade_history(self):
         self.tbl_trade_hist.setRowCount(len(self.simulator.trade_history))
@@ -2249,12 +2722,14 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.btn_next.setEnabled(enabled)
         # 修复(2026-08-31)：不切换 le_trade_price 的 enabled 状态，改样式提示
         self.le_trade_price.setStyleSheet(
-            "color: #888888; background-color: #333333;" if not enabled else "")
+            "color: #888888; background-color: #333333;" if not enabled else
+            "color: #E6E9ED; background-color: #0D1116;")
         self.sb_trade_amount.setEnabled(enabled)
         self.btn_qty_minus.setEnabled(enabled)
         self.btn_qty_plus.setEnabled(enabled)
         self.ratio_combo.setEnabled(enabled)
 
     def closeEvent(self, event):
+        self.stop_playback()
         self._save_settings()
         event.accept()

@@ -10,13 +10,13 @@ ZOOM_STEP = 5
 MIN_DISPLAY_COUNT = 5
 KLINE_WIDTH = 0.6
 VOLUME_WIDTH = 0.4
-UP_COLOR = '#FF4500'
-DOWN_COLOR = '#00FF00'
+UP_COLOR = '#EF5350'
+DOWN_COLOR = '#26A69A'
 MA_COLORS = {
-    5: '#FFFFFF',
-    10: '#FFFF00',
-    20: '#9932CC',
-    60: '#00FF00'
+    5: '#CFD5DD',
+    10: '#E8BD58',
+    20: '#A17BD9',
+    60: '#5589CE'
 }
 
 # 文件编码尝试顺序

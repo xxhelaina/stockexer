@@ -6,6 +6,7 @@ from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +45,15 @@ class TradeRecord:
 class TradingSimulator:
     """交易模拟器，使用Decimal处理资金避免浮点误差"""
 
-    def __init__(self, initial_capital: float = 1000000.0, fee_rate: float = 0.003):
+    def __init__(self, initial_capital: float = 1000000.0, fee_rate: float = 0.003,
+                 allow_t0: bool = True):
+        if not math.isfinite(initial_capital) or initial_capital <= 0:
+            raise ValueError('初始资金必须是大于0的有限数值')
+        if not math.isfinite(fee_rate) or not 0 <= fee_rate <= 1:
+            raise ValueError('费率必须在0到1之间')
         self.initial_capital = Decimal(str(initial_capital))
         self.fee_rate = Decimal(str(fee_rate))
+        self.allow_t0 = allow_t0
         self.reset()
 
     def reset(self) -> None:
@@ -56,6 +63,7 @@ class TradingSimulator:
         self.realized_pnl: Dict[str, Decimal] = {}
         self.trade_history: List[TradeRecord] = []
         self.current_stock: Optional[str] = None
+        self.purchases_by_day = {}
 
     def set_current_stock(self, stock_code: str) -> None:
         self.current_stock = stock_code
@@ -67,8 +75,10 @@ class TradingSimulator:
     def can_buy(self, price: float, amount: int) -> Tuple[bool, str]:
         if not self.current_stock:
             return False, "未设置当前股票"
-        if price <= 0 or amount <= 0:
+        if not math.isfinite(price) or price <= 0 or amount <= 0 or int(amount) != amount:
             return False, "价格和数量必须大于0"
+        if amount % 100:
+            return False, '本训练采用简化100股一手规则，买入数量须为100的整数倍'
         price_dec = Decimal(str(price))
         total_cost = price_dec * amount * (1 + self.fee_rate)
         if total_cost > self.current_capital:
@@ -92,6 +102,8 @@ class TradingSimulator:
             old_cost * old_amount + total_cost) / new_amount
         self.current_capital -= total_cost
         self.positions[self.current_stock] = new_amount
+        day_key = (self.current_stock, trade_date.date())
+        self.purchases_by_day[day_key] = self.purchases_by_day.get(day_key, 0) + amount
         record = TradeRecord(
             date=trade_date,
             stock_code=self.current_stock,
@@ -106,19 +118,31 @@ class TradingSimulator:
         logger.info(f"买入 {stock_name}({self.current_stock}) {amount}股 @ {price:.2f}")
         return record
 
-    def can_sell(self, price: float, amount: int) -> Tuple[bool, str]:
+    def get_sellable_hold(self, trade_date: datetime) -> int:
+        hold = self.get_current_hold()
+        if self.allow_t0:
+            return hold
+        return max(0, hold - self.purchases_by_day.get((self.current_stock, trade_date.date()), 0))
+
+    def can_sell(self, price: float, amount: int, trade_date: datetime = None) -> Tuple[bool, str]:
         if not self.current_stock:
             return False, "未设置当前股票"
-        if price <= 0 or amount <= 0:
+        if not math.isfinite(price) or price <= 0 or amount <= 0 or int(amount) != amount:
             return False, "价格和数量必须大于0"
         current_hold = self.positions.get(self.current_stock, 0)
         if amount > current_hold:
             return False, f"持仓不足，当前持仓{current_hold}股，试图卖出{amount}股"
+        if not self.allow_t0:
+            if trade_date is None:
+                return False, 'T+1校验需要交易日期'
+            sellable = self.get_sellable_hold(trade_date)
+            if amount > sellable:
+                return False, f'T+1限制：今日买入不可卖出，当前可卖 {sellable} 股'
         return True, ""
 
     def sell(self, price: float, amount: int,
              stock_name: str, trade_date: datetime) -> Optional[TradeRecord]:
-        can_sell, error_msg = self.can_sell(price, amount)
+        can_sell, error_msg = self.can_sell(price, amount, trade_date)
         if not can_sell:
             logger.warning(f"卖出失败: {error_msg}")
             return None
@@ -169,6 +193,40 @@ class TradingSimulator:
 
     def get_realized_pnl(self) -> float:
         return float(self.realized_pnl.get(self.current_stock, Decimal('0')))
+
+    def to_snapshot(self):
+        records = []
+        for record in self.trade_history:
+            item = record.to_dict()
+            item['date'] = record.date.isoformat()
+            records.append(item)
+        return {'initial_capital': format(self.initial_capital.normalize(), 'f'),
+                'fee_rate': format(self.fee_rate.normalize(), 'f'),
+                'allow_t0': self.allow_t0, 'stock_code': self.current_stock, 'trades': records}
+
+    @classmethod
+    def from_snapshot(cls, snapshot):
+        if not isinstance(snapshot['allow_t0'], bool):
+            raise ValueError('存档交易规则错误')
+        simulator = cls(float(snapshot['initial_capital']), float(snapshot['fee_rate']),
+                        bool(snapshot['allow_t0']))
+        simulator.set_current_stock(snapshot['stock_code'])
+        previous = None
+        for item in snapshot['trades']:
+            day = datetime.fromisoformat(item['date'])
+            if previous is not None and day < previous:
+                raise ValueError('存档成交时间顺序错误')
+            previous = day
+            if item['stock_code'] != simulator.current_stock:
+                raise ValueError('存档股票与成交记录不一致')
+            if item['action'] not in ('买入', '卖出'):
+                raise ValueError('存档交易方向错误')
+            if int(item['amount']) != item['amount'] or item['amount'] <= 0:
+                raise ValueError('存档成交数量错误')
+            method = simulator.buy if item['action'] == '买入' else simulator.sell
+            if method(float(item['price']), int(item['amount']), item['stock_name'], day) is None:
+                raise ValueError('存档包含不合法的交易')
+        return simulator
 
     @property
     def current_capital_float(self) -> float:
