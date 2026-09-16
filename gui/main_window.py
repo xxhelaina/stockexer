@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QButtonGroup, QCheckBox,
     QPushButton, QDateEdit, QDateTimeEdit, QSpinBox, QTableWidget, QTableWidgetItem,
     QGroupBox, QGridLayout, QMessageBox, QHeaderView, QSizePolicy,
-    QComboBox, QFileDialog, QProgressDialog, QDialog, QScrollArea, QFrame,
+    QComboBox, QFileDialog, QProgressDialog, QDialog, QScrollArea, QFrame, QDoubleSpinBox,
     QAbstractItemView, QStackedWidget, QAbstractSpinBox
 )
 from PyQt6.QtCore import Qt, QDate, QDateTime, QSettings, QTimer
@@ -33,6 +33,7 @@ from data_loader import (
     parse_tdx_day_file, load_tdx_text_file, load_market_data_file
 )
 from gui.chart_canvas import MyFigureCanvas
+from gui.drawing_tools import DrawingToolsMixin
 from gui.download_dialog import DownloadDialog
 from gui.scan_thread import ScanFolderThread
 from gui.precompute_thread import PrecomputeIndicatorsThread
@@ -45,7 +46,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 matplotlib.use('QtAgg')
 
 
-class StockDoubleBlindTrainer(QMainWindow):
+class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
     ZOOM_STEP = config.ZOOM_STEP
     MIN_DISPLAY_COUNT = config.MIN_DISPLAY_COUNT
     # 分钟级周期（分时图仅对这些周期可用）
@@ -114,6 +115,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.drawing_mode = 'cursor'
         self.drawings = []
         self._trend_anchor = None
+        self.reset_drawing_interaction()
         self.session_finished = False
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self.next_trading_day)
@@ -394,12 +396,11 @@ class StockDoubleBlindTrainer(QMainWindow):
             button.setCheckable(True)
             button.setObjectName('periodBtn')
             button.clicked.connect(lambda _, m=mode: self.set_drawing_mode(m))
+            button.setToolTip('点击选中画线；拖动整条线或端点；空白处拖动平移' if mode == 'cursor'
+                              else '点击绘制，Esc 取消；编辑时先切回十字光标')
             tools.addWidget(button)
             self.drawing_buttons[mode] = button
         self.drawing_buttons['cursor'].setChecked(True)
-        clear = QPushButton('清除画线')
-        clear.clicked.connect(self.clear_drawings)
-        tools.addWidget(clear)
         tools.addStretch()
         shot = QPushButton('截图')
         shot.clicked.connect(self.export_chart)
@@ -408,6 +409,46 @@ class StockDoubleBlindTrainer(QMainWindow):
         full.clicked.connect(lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen())
         tools.addWidget(full)
         chart_layout.addLayout(tools)
+        drawing_tools = QHBoxLayout()
+        drawing_tools.addWidget(QLabel('画线样式'))
+        self.drawing_color = QComboBox()
+        for title, color in [('蓝色', '#639CFF'), ('青绿', '#00BC8A'), ('红色', '#FF6471'),
+                             ('黄色', '#FFD166'), ('白色', '#E2E8F0')]:
+            self.drawing_color.addItem(title, color)
+        self.drawing_width = QDoubleSpinBox()
+        self.drawing_width.setRange(.5, 5)
+        self.drawing_width.setSingleStep(.5)
+        self.drawing_width.setValue(1.3)
+        self.drawing_width.setSuffix(' px')
+        self.drawing_style = QComboBox()
+        for title, style in [('实线', '-'), ('虚线', '--'), ('点线', ':')]:
+            self.drawing_style.addItem(title, style)
+        for control, signal in [(self.drawing_color, self.drawing_color.currentIndexChanged),
+                                (self.drawing_width, self.drawing_width.valueChanged),
+                                (self.drawing_style, self.drawing_style.currentIndexChanged)]:
+            drawing_tools.addWidget(control)
+            signal.connect(self.apply_drawing_style)
+        for attr, title, callback, tip in [
+                ('btn_drawing_delete', '删除', self.delete_selected_drawing, '删除选中画线 · Delete'),
+                ('btn_drawing_undo', '撤销', self.undo_drawing, '撤销画线操作 · Ctrl+Z'),
+                ('btn_drawing_redo', '重做', self.redo_drawing, '重做画线操作 · Ctrl+Y / Ctrl+Shift+Z'),
+                ('btn_drawing_lock', '锁定', self.toggle_drawing_lock, '锁定选中画线，防止误拖动')]:
+            button = QPushButton(title)
+            button.setToolTip(tip)
+            button.clicked.connect(callback)
+            drawing_tools.addWidget(button)
+            setattr(self, attr, button)
+        self.show_drawings = QCheckBox('显示画线')
+        self.show_drawings.setChecked(True)
+        self.show_drawings.toggled.connect(self.toggle_drawings_visible)
+        drawing_tools.addWidget(self.show_drawings)
+        clear = QPushButton('清空')
+        clear.setToolTip('清空所有周期的画线，可撤销')
+        clear.clicked.connect(self.clear_drawings)
+        drawing_tools.addWidget(clear)
+        drawing_tools.addStretch()
+        chart_layout.addLayout(drawing_tools)
+        self._update_drawing_controls()
         self.period_buttons['D'].setChecked(True)
 
         self.fig = Figure(figsize=(12, 7), dpi=100)
@@ -472,33 +513,55 @@ class StockDoubleBlindTrainer(QMainWindow):
         dialog.exec()
 
     def set_drawing_mode(self, mode):
+        self.cancel_drawing_gesture()
         self.drawing_mode = mode
-        self._trend_anchor = None
+        self.selected_drawing = None
         for key, button in self.drawing_buttons.items():
             button.setChecked(key == mode)
         self.cursor_mode = mode == 'cursor'
         self._cursor_price = None
+        self._update_drawing_controls()
         self._draw_combined_chart()
+        self.canvas.setFocus()
+        self.statusBar().showMessage('点击画线选中，拖动端点或整条线 · Delete 删除 · Ctrl+Z 撤销'
+                                    if mode == 'cursor' else '点击绘制 · Esc 取消并返回查看模式', 5000)
 
     def add_drawing_point(self, x_data, price):
-        idx = max(self.display_start_idx, min(self.display_end_idx,
-                  self.display_start_idx + int(np.floor(x_data + .5))))
-        point = [self.stock_data.index[idx].isoformat(), float(price)]
+        if not self._is_training_active_silent():
+            return
+        point = self._drawing_point(x_data, price)
         if self.drawing_mode == 'horizontal':
-            self.drawings.append({'period': self.current_period, 'type': 'horizontal', 'points': [point]})
+            self._remember_drawings()
+            self.drawings.append({'period': self.current_period, 'type': 'horizontal', 'points': [point],
+                                  **self.current_drawing_style()})
         elif self.drawing_mode == 'trend':
+            if self._trend_period != self.current_period:
+                self._trend_anchor = None
             if self._trend_anchor is None:
                 self._trend_anchor = point
-                self.statusBar().showMessage('趋势线：请点击第二个端点', 5000)
+                self._trend_period = self.current_period
+                self.stop_playback()
+                self.statusBar().showMessage('趋势线：移动鼠标预览，点击第二个端点 · Esc 取消', 5000)
+                self._draw_combined_chart()
                 return
+            self._remember_drawings()
             self.drawings.append({'period': self.current_period, 'type': 'trend',
-                                  'points': [self._trend_anchor, point]})
+                                  'points': [self._trend_anchor, point], **self.current_drawing_style()})
             self._trend_anchor = None
+            self._drawing_preview = None
+        else:
+            return
+        self.selected_drawing = len(self.drawings) - 1
+        self._update_drawing_controls()
         self._draw_combined_chart()
 
     def clear_drawings(self):
+        self.cancel_drawing_gesture()
+        if self.drawings:
+            self._remember_drawings()
         self.drawings = []
-        self._trend_anchor = None
+        self.selected_drawing = None
+        self._update_drawing_controls()
         self._draw_combined_chart()
 
     def _draw_annotations(self, start_idx, end_idx):
@@ -512,15 +575,7 @@ class StockDoubleBlindTrainer(QMainWindow):
                     marker='^' if buy else 'v', color='#FF6471' if buy else '#00BC8A',
                     s=65, edgecolors='#FFFFFF', linewidths=.5, zorder=12)
                 self.trade_markers.append(marker)
-        for drawing in self.drawings:
-            if drawing['period'] != self.current_period:
-                continue
-            if drawing['type'] == 'horizontal':
-                self.ax_kline.axhline(drawing['points'][0][1], color='#639CFF', linewidth=1)
-            else:
-                points = drawing['points']
-                xs = [int(self.stock_data.index.searchsorted(pd.Timestamp(p[0]))) - start_idx for p in points]
-                self.ax_kline.plot(xs, [p[1] for p in points], color='#639CFF', linewidth=1.3)
+        self._render_drawings()
 
     def export_chart(self):
         if not self._is_training_active_silent():
@@ -628,6 +683,11 @@ class StockDoubleBlindTrainer(QMainWindow):
                     raise ValueError('存档画线类型错误')
                 if len(drawing['points']) != (1 if drawing['type'] == 'horizontal' else 2):
                     raise ValueError('存档画线端点错误')
+                if (drawing.get('color', '#639CFF') not in ('#639CFF', '#00BC8A', '#FF6471', '#FFD166', '#E2E8F0')
+                        or drawing.get('style', '-') not in ('-', '--', ':')
+                        or not .5 <= float(drawing.get('width', 1.3)) <= 5
+                        or not isinstance(drawing.get('locked', False), bool)):
+                    raise ValueError('存档画线样式错误')
                 for timestamp, price in drawing['points']:
                     pd.Timestamp(timestamp)
                     if not np.isfinite(float(price)):
@@ -672,6 +732,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         self.display_start_idx, self.display_end_idx = payload['display']
         self.session_finished = payload['finished']
         self.drawings = payload['drawings']
+        self.reset_drawing_interaction()
         self.cursor_mode = True
         self.cursor_abs_idx = self.current_date_idx
         self._cursor_price = None
@@ -699,6 +760,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         self._set_session_mode(True)
         self._update_trade_buttons_state()
         self._draw_combined_chart()
+        self.canvas.setFocus()
         self.lbl_source_status.setText('● 已恢复离线存档')
         self.statusBar().showMessage('训练进度、持仓、行情和画线已恢复', 6000)
 
@@ -1209,6 +1271,8 @@ class StockDoubleBlindTrainer(QMainWindow):
             self.de_start_date.setDateTime(mid_qt)
 
     def clear_imported_data(self):
+        self.drawings = []
+        self.reset_drawing_interaction()
         self.raw_min_data = None
         self.is_min_data = False
         self.source_period_key = 'D'
@@ -1256,6 +1320,11 @@ class StockDoubleBlindTrainer(QMainWindow):
             self._set_checked_period(self.current_period)
             return
         self.stop_playback()
+        self.finish_drawing_drag()
+        self.cancel_drawing_gesture()
+        self.selected_drawing = None
+        self._update_drawing_controls()
+        self._draw_combined_chart()
 
         if new_period_key.endswith('min') and self.source_period_key.endswith('min'):
             source_minutes = int(self.source_period_key[:-3])
@@ -1738,7 +1807,7 @@ class StockDoubleBlindTrainer(QMainWindow):
             self.cursor_abs_idx = self.current_date_idx
             self._cursor_price = None
             self.drawings = []
-            self._trend_anchor = None
+            self.reset_drawing_interaction()
 
             self.display_start_idx = max(0, self.current_date_idx - 60)
             self.display_end_idx = self.current_date_idx
@@ -1751,6 +1820,7 @@ class StockDoubleBlindTrainer(QMainWindow):
 
             self._save_settings()
             self._set_session_mode(True)
+            self.canvas.setFocus()
             self.statusBar().showMessage(
                 f"{start_note}复盘已开始 · 首根待交易K线 {self.trading_days[self.next_idx].strftime('%Y-%m-%d %H:%M')}",
                 10000)
@@ -1772,7 +1842,7 @@ class StockDoubleBlindTrainer(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.session_finished = False
             self.drawings = []
-            self._trend_anchor = None
+            self.reset_drawing_interaction()
             if hasattr(self, '_user_target_datetime'):
                 del self._user_target_datetime
             # 修复(2026-08-31)：原 plt.close('all') 会销毁画布绑定的 Figure，
@@ -2066,6 +2136,7 @@ class StockDoubleBlindTrainer(QMainWindow):
     def _pan(self, delta: int):
         if self.stock_data is None or self.current_date_idx < 0:
             return
+        self.finish_drawing_drag()
         window_size = self.display_end_idx - self.display_start_idx + 1
         new_start = self.display_start_idx + delta
         new_end = self.display_end_idx + delta
@@ -2087,18 +2158,25 @@ class StockDoubleBlindTrainer(QMainWindow):
     def _zoom_out(self):
         self._zoom(1.2)
 
-    def _zoom(self, factor: float):
+    def _zoom(self, factor: float, anchor_x: Optional[float] = None):
         if self.stock_data is None or self.current_date_idx < 0:
             return
+        self.finish_drawing_drag()
         window_size = self.display_end_idx - self.display_start_idx + 1
         max_window = self.current_date_idx + 1
         new_window_size = int(window_size * factor)
-        new_window_size = max(self.MIN_DISPLAY_COUNT, min(max_window, new_window_size))
+        new_window_size = max(min(self.MIN_DISPLAY_COUNT, max_window), min(max_window, new_window_size))
         if new_window_size == window_size:
             return
-        center = (self.display_start_idx + self.display_end_idx) // 2
-        half = new_window_size // 2
-        new_start = center - half
+        if anchor_x is not None:
+            anchor_x = max(-.5, min(window_size - .5, anchor_x))
+            # 柱中心偏移 .5：缩放前后保持鼠标在绘图区的相对横向位置。
+            fraction = (anchor_x + .5) / window_size
+            absolute_anchor = self.display_start_idx + anchor_x
+            new_start = int(round(absolute_anchor + .5 - fraction * new_window_size))
+        else:
+            center = (self.display_start_idx + self.display_end_idx) // 2
+            new_start = center - new_window_size // 2
         new_end = new_start + new_window_size - 1
         if new_start < 0:
             new_start = 0
@@ -2135,39 +2213,16 @@ class StockDoubleBlindTrainer(QMainWindow):
 
     # ========== 光标模式方法 ==========
     def _move_cursor_left(self):
-        if not self.cursor_mode or self.stock_data is None:
-            self.cursor_mode = True
-            self.cursor_abs_idx = self.current_date_idx
-        else:
-            self.cursor_abs_idx = max(0, self.cursor_abs_idx - 1)
-        window_changed = self._ensure_cursor_visible()
-        if window_changed:
-            self._draw_combined_chart()
-        else:
-            self._update_cursor_overlay()
+        target = self.current_date_idx if not self.cursor_mode else max(0, self.cursor_abs_idx - 1)
+        self._move_cursor_to_index(target, fast=True)
 
     def _move_cursor_right(self):
-        if not self.cursor_mode or self.stock_data is None:
-            self.cursor_mode = True
-            self.cursor_abs_idx = self.current_date_idx
-        else:
-            # 训练模式下未来 K 线尚未揭示，光标最右只能到当前可见 K 线。
-            max_idx = self.current_date_idx
-            self.cursor_abs_idx = min(max_idx, self.cursor_abs_idx + 1)
-        window_changed = self._ensure_cursor_visible()
-        if window_changed:
-            self._draw_combined_chart()
-        else:
-            self._update_cursor_overlay()
+        target = self.current_date_idx if not self.cursor_mode else min(self.current_date_idx, self.cursor_abs_idx + 1)
+        self._move_cursor_to_index(target, fast=True)
 
     def _move_cursor_to_index(self, idx: int, fast: bool = False, price=None):
         if self.stock_data is None:
             return
-        if self.session_finished:
-            self._set_trade_buttons_enabled(False)
-            self.btn_play.setEnabled(False)
-            return
-        self.btn_play.setEnabled(True)
         max_idx = min(len(self.stock_data) - 1, self.current_date_idx)
         if idx < 0 or idx > max_idx:
             return
@@ -2286,6 +2341,7 @@ class StockDoubleBlindTrainer(QMainWindow):
             if visible and ax.get_visible():
                 for artist in artists:
                     ax.draw_artist(artist)
+        self._paint_drawing_overlay()
         self.canvas.blit(self.fig.bbox)
 
     def _update_chart_quote_at(self, idx: int):
@@ -2307,20 +2363,28 @@ class StockDoubleBlindTrainer(QMainWindow):
             f"{change:+.2f} ({change_pct:+.2f}%)   VOL {volume:,.0f}")
 
     def toggle_cursor_mode(self):
+        if self.drawing_mode != 'cursor':
+            self.set_drawing_mode('cursor')
+            return
         self.cursor_mode = not self.cursor_mode
         if self.cursor_mode:
             self.cursor_abs_idx = self.current_date_idx
-            self.statusBar().showMessage("光标模式 · 鼠标或方向键查看K线，双击返回缩放", 5000)
+            self.statusBar().showMessage("光标模式 · 鼠标查看K线，左右方向键平移图表，Ctrl＋滚轮定位缩放", 5000)
         else:
             self.cursor_abs_idx = -1
             self.statusBar().showMessage("缩放模式 · 滚轮缩放，方向键平移", 5000)
         self._draw_combined_chart()
 
     def exit_cursor_mode(self):
-        if self.cursor_mode:
-            self.cursor_mode = False
-            self.cursor_abs_idx = -1
-            self._draw_combined_chart()
+        self.cancel_drawing_gesture()
+        self.drawing_mode = 'cursor'
+        self.selected_drawing = None
+        for mode, button in self.drawing_buttons.items():
+            button.setChecked(mode == 'cursor')
+        self.cursor_mode = False
+        self.cursor_abs_idx = -1
+        self._update_drawing_controls()
+        self._draw_combined_chart()
 
     # ========== 绘图方法 ==========
     def _draw_combined_chart(self):

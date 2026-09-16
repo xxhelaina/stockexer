@@ -39,7 +39,20 @@ class MyFigureCanvas(FigureCanvas):
             return
 
         key = event.key()
-        if key == Qt.Key.Key_Escape:
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if ctrl and key == Qt.Key.Key_Z:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.parent_window.redo_drawing()
+            else:
+                self.parent_window.undo_drawing()
+            event.accept()
+        elif ctrl and key == Qt.Key.Key_Y:
+            self.parent_window.redo_drawing()
+            event.accept()
+        elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.parent_window.delete_selected_drawing()
+            event.accept()
+        elif key == Qt.Key.Key_Escape:
             self.parent_window.exit_cursor_mode()
             event.accept()
         elif key == Qt.Key.Key_F5:
@@ -52,10 +65,10 @@ class MyFigureCanvas(FigureCanvas):
             self.parent_window._zoom_out()
             event.accept()
         elif key == Qt.Key.Key_Left:
-            (self.parent_window._move_cursor_left if self.parent_window.cursor_mode else self.parent_window._pan_left)()
+            self.parent_window._pan_left(1)
             event.accept()
         elif key == Qt.Key.Key_Right:
-            (self.parent_window._move_cursor_right if self.parent_window.cursor_mode else self.parent_window._pan_right)()
+            self.parent_window._pan_right(1)
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -72,6 +85,9 @@ class MyFigureCanvas(FigureCanvas):
                 self.parent_window.add_drawing_point(*coords)
                 event.accept()
                 return
+            if coords is not None and self.parent_window.begin_drawing_drag(*coords):
+                event.accept()
+                return
             self._drag_x = event.position().x()
             if self._try_move_cursor_from_event(event):
                 event.accept()
@@ -82,6 +98,16 @@ class MyFigureCanvas(FigureCanvas):
     def mouseMoveEvent(self, event):
         if not self.parent_window._is_training_active_silent():
             event.ignore()
+            return
+
+        coords = self._data_coords(event)
+        if self.parent_window._drawing_drag is not None:
+            if coords is not None:
+                self.parent_window.move_drawing_drag(*coords)
+            event.accept()
+            return
+        if self.parent_window.update_drawing_preview(coords):
+            event.accept()
             return
 
         if self._drag_x is not None and event.buttons() & Qt.MouseButton.LeftButton:
@@ -104,17 +130,39 @@ class MyFigureCanvas(FigureCanvas):
 
     def mouseReleaseEvent(self, event):
         self._drag_x = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.parent_window._drawing_drag is not None:
+                coords = self._data_coords(event)
+                if coords is not None:
+                    self.parent_window.move_drawing_drag(*coords)
+                self.parent_window.finish_drawing_drag()
+                event.accept()
+                return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         self._drag_x = None
         if self.parent_window._is_training_active_silent():
-            self.parent_window.toggle_cursor_mode()
+            if self.parent_window.drawing_mode == 'cursor' and self.parent_window._drawing_drag is None:
+                self.parent_window.toggle_cursor_mode()
             event.accept()
 
     def wheelEvent(self, event):
         if self.parent_window._is_training_active_silent() and event.angleDelta().y():
-            self.parent_window._zoom_in() if event.angleDelta().y() > 0 else self.parent_window._zoom_out()
+            self.parent_window.finish_drawing_drag()
+            self.setFocus()
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                pixels = self.mouseEventCoords(event)
+                anchor = None
+                for axis in (self.parent_window.ax_kline, self.parent_window.ax_volume, self.parent_window.ax_macd):
+                    if axis.get_visible() and axis.bbox.contains(*pixels):
+                        anchor = float(axis.transData.inverted().transform(pixels)[0])
+                        break
+                self.parent_window._zoom(.8 if event.angleDelta().y() > 0 else 1.2, anchor_x=anchor)
+                if self.parent_window.cursor_mode:
+                    self._try_move_cursor_from_event(event)
+            else:
+                self.parent_window._zoom_in() if event.angleDelta().y() > 0 else self.parent_window._zoom_out()
             event.accept()
         else:
             super().wheelEvent(event)

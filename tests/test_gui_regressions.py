@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 from PyQt6.QtCore import QDateTime, QPoint, QPointF, Qt, QEvent
-from PyQt6.QtGui import QWheelEvent, QMouseEvent
+from PyQt6.QtGui import QWheelEvent, QMouseEvent, QKeyEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from gui.main_window import StockDoubleBlindTrainer
@@ -133,6 +133,10 @@ class GuiRegressionTests(unittest.TestCase):
         w.buy_stock()
         w.set_drawing_mode('horizontal')
         w.add_drawing_point(10, 20.25)
+        w.drawing_color.setCurrentIndex(3)
+        w.drawing_width.setValue(2.5)
+        w.drawing_style.setCurrentIndex(1)
+        w.toggle_drawing_lock()
         w.indicator_checks['MACD'].setChecked(True)
         original = w.simulator.to_snapshot()
         with tempfile.TemporaryDirectory() as directory:
@@ -150,6 +154,11 @@ class GuiRegressionTests(unittest.TestCase):
         self.assertEqual(w.simulator.to_snapshot(), original)
         self.assertEqual(w.current_period, '5min')
         self.assertEqual(len(w.drawings), 1)
+        self.assertEqual(w.drawings[0]['color'], '#FFD166')
+        self.assertEqual(w.drawings[0]['width'], 2.5)
+        self.assertEqual(w.drawings[0]['style'], '--')
+        self.assertTrue(w.drawings[0]['locked'])
+        self.assertEqual(w._drawing_undo, [])
         self.assertTrue(w.indicator_checks['MACD'].isChecked())
         self.assertEqual(len(w.trade_markers), 1)
 
@@ -243,6 +252,175 @@ class GuiRegressionTests(unittest.TestCase):
                                  Qt.KeyboardModifier.NoModifier))
         self.assertIsNone(canvas._drag_x)
 
+    def drawing_mouse(self, kind, x, price, held=False):
+        canvas = self.window.canvas
+        pixels = self.window.ax_kline.transData.transform((x, price))
+        point = QPointF(pixels[0] / canvas.device_pixel_ratio,
+                        (canvas.figure.bbox.height - pixels[1]) / canvas.device_pixel_ratio)
+        button = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseMove else Qt.MouseButton.LeftButton
+        buttons = Qt.MouseButton.LeftButton if held else Qt.MouseButton.NoButton
+        event = QMouseEvent(kind, point, point, button, buttons, Qt.KeyboardModifier.NoModifier)
+        {QEvent.Type.MouseButtonPress: canvas.mousePressEvent,
+         QEvent.Type.MouseMove: canvas.mouseMoveEvent,
+         QEvent.Type.MouseButtonRelease: canvas.mouseReleaseEvent}[kind](event)
+
+    def test_drawing_preview_blits_and_escape_cancels_anchor(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('trend')
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 5, 20.2, True)
+        self.drawing_mouse(QEvent.Type.MouseButtonRelease, 5, 20.2)
+        self.assertIsNotNone(w._trend_anchor)
+        with patch.object(w, '_draw_combined_chart') as redraw:
+            self.drawing_mouse(QEvent.Type.MouseMove, 15, 20.4)
+            self.drawing_mouse(QEvent.Type.MouseMove, 20, 20.5)
+            redraw.assert_not_called()
+        self.assertEqual(len(w.drawings), 0)
+        self.assertEqual(list(w._preview_artist.get_xdata()), [5, 20])
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                                         Qt.KeyboardModifier.NoModifier))
+        self.assertIsNone(w._trend_anchor)
+        self.assertEqual(w.drawing_mode, 'cursor')
+        self.assertFalse(w._preview_artist.get_visible())
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 15, 20.4, True)
+        self.drawing_mouse(QEvent.Type.MouseButtonRelease, 15, 20.4)
+        self.assertEqual(w.drawings, [])
+
+    def test_drawing_endpoint_and_whole_line_drag_with_undo(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('trend')
+        w.add_drawing_point(5, 20.2)
+        w.add_drawing_point(15, 20.4)
+        w.set_drawing_mode('cursor')
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 5, 20.2, True)
+        self.assertIsNotNone(w._drawing_drag)
+        with patch.object(w, '_draw_combined_chart') as redraw:
+            self.drawing_mouse(QEvent.Type.MouseMove, 7, 20.25, True)
+            redraw.assert_not_called()
+        self.drawing_mouse(QEvent.Type.MouseButtonRelease, 7, 20.25)
+        self.assertEqual(w.drawings[0]['points'][0][0], w.stock_data.index[7].isoformat())
+        self.assertAlmostEqual(w.drawings[0]['points'][0][1], 20.25)
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 11, 20.325, True)
+        self.assertIsNone(w._drawing_drag['endpoint'])
+        self.drawing_mouse(QEvent.Type.MouseMove, 14, 20.425, True)
+        self.drawing_mouse(QEvent.Type.MouseButtonRelease, 14, 20.425)
+        self.assertEqual(w.drawings[0]['points'][0][0], w.stock_data.index[10].isoformat())
+        self.assertEqual(w.drawings[0]['points'][1][0], w.stock_data.index[18].isoformat())
+        self.assertAlmostEqual(w.drawings[0]['points'][0][1], 20.35)
+        w.undo_drawing()
+        self.assertEqual(w.drawings[0]['points'][0][0], w.stock_data.index[7].isoformat())
+        w.redo_drawing()
+        self.assertEqual(w.drawings[0]['points'][0][0], w.stock_data.index[10].isoformat())
+
+    def test_horizontal_selection_lock_delete_clear_and_history(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('horizontal')
+        w.add_drawing_point(5, 20.3)
+        w.set_drawing_mode('cursor')
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 20, 20.3, True)
+        self.drawing_mouse(QEvent.Type.MouseButtonRelease, 20, 20.4)
+        self.assertAlmostEqual(w.drawings[0]['points'][0][1], 20.4)
+        w.drawing_color.setCurrentIndex(3)
+        w.drawing_style.setCurrentIndex(1)
+        self.assertEqual(w.drawings[0]['color'], '#FFD166')
+        self.assertEqual(w.drawings[0]['style'], '--')
+        w.toggle_drawing_lock()
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 20, 20.4, True)
+        self.assertIsNone(w._drawing_drag)
+        w.delete_selected_drawing()
+        self.assertEqual(len(w.drawings), 1)
+        w.toggle_drawing_lock()
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete,
+                                         Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(w.drawings, [])
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z,
+                                         Qt.KeyboardModifier.ControlModifier))
+        self.assertEqual(len(w.drawings), 1)
+        w.clear_drawings()
+        w.undo_drawing()
+        self.assertEqual(len(w.drawings), 1)
+        w.redo_drawing()
+        self.assertEqual(w.drawings, [])
+
+    def test_escape_restores_drag_and_hidden_drawings_cannot_be_picked(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('trend')
+        w.add_drawing_point(5, 20.2)
+        w.add_drawing_point(15, 20.4)
+        original = [point[:] for point in w.drawings[0]['points']]
+        w.set_drawing_mode('cursor')
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 5, 20.2, True)
+        self.drawing_mouse(QEvent.Type.MouseMove, 8, 20.3, True)
+        w.exit_cursor_mode()
+        self.assertEqual(w.drawings[0]['points'], original)
+        self.assertIsNone(w._drawing_drag)
+        w.show_drawings.setChecked(False)
+        self.assertFalse(w.begin_drawing_drag(5, 20.2))
+        self.assertEqual(w._drawing_artists, {})
+        w.show_drawings.setChecked(True)
+        self.assertIn(0, w._drawing_artists)
+
+    def test_drawing_new_session_resets_undo_and_preview(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('horizontal')
+        w.add_drawing_point(5, 20.3)
+        w.set_drawing_mode('trend')
+        w.add_drawing_point(5, 20.2)
+        w.start_training()
+        self.wait_for(lambda: w.precompute_thread is None)
+        self.assertEqual(w.drawings, [])
+        self.assertEqual(w._drawing_undo, [])
+        self.assertIsNone(w._trend_anchor)
+        self.assertEqual(w.drawing_mode, 'cursor')
+
+    def test_preview_and_drag_no_trails_after_resize(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('trend')
+        w.add_drawing_point(5, 20.2)
+        for size in [(1280, 800), (1120, 720)]:
+            w.resize(*size)
+            self.app.processEvents()
+            for x in range(6, 30):
+                w.update_drawing_preview((x, 20.3 + x * .005))
+            actual = np.asarray(w.canvas.buffer_rgba()).copy()
+            w.canvas.draw()
+            np.testing.assert_array_equal(actual, np.asarray(w.canvas.buffer_rgba()))
+        w.add_drawing_point(15, 20.4)
+        w.set_drawing_mode('cursor')
+        self.drawing_mouse(QEvent.Type.MouseButtonPress, 5, 20.2, True)
+        for x in range(6, 25):
+            self.drawing_mouse(QEvent.Type.MouseMove, x, 20.3 + x * .005, True)
+        actual = np.asarray(w.canvas.buffer_rgba()).copy()
+        w.canvas.draw()
+        np.testing.assert_array_equal(actual, np.asarray(w.canvas.buffer_rgba()))
+        self.drawing_mouse(QEvent.Type.MouseButtonRelease, 24, 20.42)
+
+    def test_legacy_drawing_archive_uses_default_style(self):
+        self.start_minute_session()
+        w = self.window
+        w.set_drawing_mode('horizontal')
+        w.add_drawing_point(5, 20.3)
+        for key in ('color', 'width', 'style'):
+            w.drawings[0].pop(key)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'legacy.json')
+            with patch('gui.main_window.QFileDialog.getSaveFileName', return_value=(path, '')):
+                w.save_session()
+            with patch('gui.main_window.QFileDialog.getOpenFileName', return_value=(path, '')), patch.object(
+                    QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes), patch.object(
+                    QMessageBox, 'warning') as warning:
+                w.load_session()
+                self.wait_for(lambda: w.precompute_thread is None)
+                warning.assert_not_called()
+        self.assertEqual(w._drawing_artists[0][0].get_color(), '#639CFF')
+        self.assertEqual(w._drawing_artists[0][0].get_linewidth(), 1.3)
+        self.assertEqual(w._drawing_artists[0][0].get_linestyle(), '-')
+
     def test_finished_session_disables_all_trading_controls(self):
         self.start_minute_session()
         w = self.window
@@ -255,6 +433,61 @@ class GuiRegressionTests(unittest.TestCase):
         index = w.current_date_idx
         w.next_trading_day()
         self.assertEqual(w.current_date_idx, index)
+
+    def test_ctrl_wheel_keeps_mouse_anchor_in_main_and_volume_panels(self):
+        self.start_minute_session()
+        w = self.window
+        for axis in (w.ax_kline, w.ax_volume):
+            w.display_start_idx, w.display_end_idx = 5, 54
+            w._draw_combined_chart()
+            pixels = (axis.bbox.x0 + axis.bbox.width * .25, axis.bbox.y0 + axis.bbox.height * .5)
+            point = QPointF(pixels[0] / w.canvas.device_pixel_ratio,
+                            (w.fig.bbox.height - pixels[1]) / w.canvas.device_pixel_ratio)
+            before = w.display_start_idx + axis.transData.inverted().transform(pixels)[0]
+            w.canvas.wheelEvent(QWheelEvent(point, point, QPoint(), QPoint(0, 120),
+                                Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False))
+            after = w.display_start_idx + axis.transData.inverted().transform(pixels)[0]
+            self.assertAlmostEqual(before, after, delta=.51)
+            self.assertEqual(w.display_end_idx - w.display_start_idx + 1, 40)
+            self.assertLessEqual(w.display_end_idx, w.current_date_idx)
+
+    def test_arrow_keys_always_pan_chart_without_moving_cursor(self):
+        self.start_minute_session()
+        w = self.window
+        w._move_cursor_to_index(20, fast=True, price=22.)
+        w.display_start_idx, w.display_end_idx = 10, 40
+        w._draw_combined_chart()
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left,
+                                        Qt.KeyboardModifier.NoModifier))
+        self.assertEqual((w.display_start_idx, w.display_end_idx), (9, 39))
+        self.assertEqual(w.cursor_abs_idx, 20)
+        self.assertEqual(w._cursor_price, 22.)
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right,
+                                        Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(w.cursor_abs_idx, 20)
+        self.assertEqual((w.display_start_idx, w.display_end_idx), (10, 40))
+        w.exit_cursor_mode()
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left,
+                                        Qt.KeyboardModifier.NoModifier))
+        self.assertEqual((w.display_start_idx, w.display_end_idx), (9, 39))
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right,
+                                        Qt.KeyboardModifier.NoModifier))
+        self.assertEqual((w.display_start_idx, w.display_end_idx), (10, 40))
+        w.display_start_idx, w.display_end_idx = 29, w.current_date_idx
+        w._draw_combined_chart()
+        w.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right,
+                                        Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(w.display_end_idx, w.current_date_idx)
+
+    def test_zoom_short_history_never_extends_beyond_revealed_data(self):
+        self.start_minute_session(target_index=3)
+        w = self.window
+        w._zoom(1.2, anchor_x=1)
+        self.assertLessEqual(w.display_end_idx, w.current_date_idx)
+        w._zoom(.8, anchor_x=1)
+        self.assertGreaterEqual(w.display_start_idx, 0)
+        self.assertLessEqual(w.display_end_idx, w.current_date_idx)
 
 
 if __name__ == '__main__':
