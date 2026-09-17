@@ -7,9 +7,11 @@ import pandas as pd
 
 from data_loader import load_market_data_file
 from online_data import download_kline, fetch_stock_universe
+from app_paths import application_dir
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-SKIP_DIRS = {'.git', '.venv', 'venv', '__pycache__', 'node_modules', 'tests', 'gui', '.idea'}
+PROJECT_DIR = str(application_dir())
+SKIP_DIRS = {'.git', '.venv', '.venv-release', '.build-tools', 'venv', '__pycache__',
+            'node_modules', 'tests', 'gui', '.idea', 'build', 'dist', 'release', '_internal', 'licenses'}
 AGGREGATION = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
 
 

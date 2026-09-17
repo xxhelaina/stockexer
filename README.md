@@ -49,9 +49,21 @@ VOL/VOLUME是数据源原始成交量，MAVOL1/2对应5/10根量均线；MACD使
 
 ## 启动
 
+Windows x64 用户可在 [GitHub Releases](https://github.com/xxhelaina/stockexer/releases)
+下载免安装文件夹版，完整解压后双击 `StockLab.exe`；必须保留 `_internal` 文件夹。
+详情见 [免安装版说明](docs/PORTABLE.md)。项目按 GPLv3 开源，见 `LICENSE`。
+
 ```powershell
 python -m pip install -r requirements.txt
 python main.py
+```
+
+构建 Windows 免安装版（Python 3.12 x64）：
+
+```powershell
+python -m venv .venv-release
+.venv-release/Scripts/python.exe -m pip install -r requirements-release.txt
+powershell -ExecutionPolicy Bypass -File scripts/build_release.ps1
 ```
 
 Windows 也可以直接双击 `start_stocklab.bat`。启动脚本会自动切换到项目目录；

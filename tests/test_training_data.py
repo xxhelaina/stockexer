@@ -158,7 +158,7 @@ class TrainingDataTests(unittest.TestCase):
     def test_online_source_with_partial_range_tries_next_provider(self):
         with patch('online_data.fetch_kline_baostock', return_value=(self.frame.iloc[:24], '短数据')), patch(
                 'online_data.fetch_kline_eastmoney', return_value=(self.frame, '浦发银行')) as eastmoney, patch(
-                'online_data.__file__', os.path.join(self.directory.name, 'online_data.py')):
+                'online_data.download_dir', return_value=os.path.join(self.directory.name, '下载数据')):
             frame, name, source = download_kline('600000', '5min', '20251101', '20251121',
                 required_range=(self.request['start'], self.request['end']))
         eastmoney.assert_called_once()
@@ -168,7 +168,7 @@ class TrainingDataTests(unittest.TestCase):
     def test_short_download_does_not_overwrite_long_cache(self):
         with patch('online_data.fetch_kline_baostock', side_effect=[(self.frame, '浦发银行'),
                        (self.frame.iloc[:24], '浦发银行')]), patch(
-                'online_data.__file__', os.path.join(self.directory.name, 'online_data.py')):
+                'online_data.download_dir', return_value=os.path.join(self.directory.name, '下载数据')):
             download_kline('600000', '5min', '20251101', '20251121')
             download_kline('600000', '5min', '20251101', '20251121')
         folder = os.path.join(self.directory.name, '下载数据')

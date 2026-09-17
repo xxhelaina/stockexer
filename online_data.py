@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 
 from utils import logger
+from app_paths import download_dir
 
 # 周期键 → 东财 klt / 腾讯周期代码
 PERIOD_KLT_MAP = {
@@ -467,7 +468,7 @@ def download_kline(code: str, period_key: str, beg: str, end: str,
     # longer history with a short request. Do not merge different adjustment or
     # provider conventions blindly.
     try:
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '下载数据')
+        out_dir = str(download_dir())
         os.makedirs(out_dir, exist_ok=True)
         begin_label = pd.Timestamp(beg).strftime('%Y%m%d')
         end_label = pd.Timestamp(end).strftime('%Y%m%d')

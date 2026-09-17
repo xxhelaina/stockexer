@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QFileDialog, QMessageBox
 from gui.auto_data_thread import AutoDataThread
 from training_data import PROJECT_DIR, range_covered
 from utils import validate_stock_code
+from app_paths import local_search_roots
 
 
 class AutoDataMixin:
@@ -19,7 +20,7 @@ class AutoDataMixin:
         self._auto_allow_online = False
         self._auto_missing = None
         self._auto_closing = False
-        self._auto_search_roots = [PROJECT_DIR] + list(self.settings.value('local_data_roots', [], type=list))
+        self._auto_search_roots = local_search_roots() + list(self.settings.value('local_data_roots', [], type=list))
         self._auto_file_paths = []
         self._auto_timer = QTimer(self)
         self._auto_timer.setSingleShot(True)

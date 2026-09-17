@@ -4,13 +4,14 @@ import re
 import logging
 from typing import Optional
 from datetime import datetime
+from app_paths import data_dir
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("trainer.log", encoding='utf-8'),
+        logging.FileHandler(data_dir() / "trainer.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )

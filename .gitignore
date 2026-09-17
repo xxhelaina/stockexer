@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 .idea/
 .vscode/
+.venv-release/
+.build-tools/
+build/
+dist/
+release/
 
 # Runtime output
 *.log
