@@ -21,12 +21,12 @@ class ScanFolderThread(QThread):
             for root, dirs, files in os.walk(self.folder_path):
                 for f in files:
                     f_lower = f.lower()
-                    if f_lower.endswith('.txt') or f_lower.endswith('.day'):
+                    if f_lower.endswith(('.txt', '.csv', '.tsv', '.day')):
                         all_files.append((root, f))
 
             total = len(all_files)
             if total == 0:
-                self.error.emit("未找到任何 .txt 或 .day 文件")
+                self.error.emit('未找到 CSV/TXT/TSV/DAY 行情文件')
                 return
 
             for idx, (root, f) in enumerate(all_files):
@@ -34,10 +34,10 @@ class ScanFolderThread(QThread):
                     return
                 f_lower = f.lower()
                 full_path = os.path.join(root, f)
-                if f_lower.endswith('.txt'):
+                if f_lower.endswith(('.txt', '.csv', '.tsv')):
                     if is_valid_kline_file(full_path):
                         rel_path = os.path.relpath(full_path, self.folder_path)
-                        stock_files[rel_path] = (full_path, None, 'txt')
+                        stock_files[rel_path] = (full_path, None, os.path.splitext(f_lower)[1][1:])
                 elif f_lower.endswith('.day'):
                     rel_path = os.path.relpath(full_path, self.folder_path)
                     stock_files[rel_path] = (full_path, None, 'day')

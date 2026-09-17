@@ -33,6 +33,11 @@ class PrecomputeIndicatorsThread(QThread):
             if self.isInterruptionRequested(): return
 
             df['MA60'] = close.rolling(window=60, min_periods=1).mean()
+            df['MA120'] = close.rolling(window=120, min_periods=1).mean()
+            df['MA250'] = close.rolling(window=250, min_periods=1).mean()
+            volume = df.get('Volume', pd.Series(0.0, index=df.index))
+            df['VOLMA5'] = volume.rolling(5, min_periods=1).mean()
+            df['VOLMA10'] = volume.rolling(10, min_periods=1).mean()
             self.progress.emit(80)
             if self.isInterruptionRequested(): return
 

@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QDateEdit, QDateTimeEdit, QSpinBox, QTableWidget, QTableWidgetItem,
     QGroupBox, QGridLayout, QMessageBox, QHeaderView, QSizePolicy,
     QComboBox, QFileDialog, QProgressDialog, QDialog, QScrollArea, QFrame, QDoubleSpinBox,
-    QAbstractItemView, QStackedWidget, QAbstractSpinBox
+    QAbstractItemView, QStackedWidget, QAbstractSpinBox, QTabWidget
 )
 from PyQt6.QtCore import Qt, QDate, QDateTime, QSettings, QTimer
 from PyQt6.QtGui import QDoubleValidator, QColor
@@ -26,6 +26,7 @@ import matplotlib
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.patches import Rectangle
+from matplotlib.ticker import MaxNLocator, FuncFormatter
 
 from models import TradingSimulator
 from data_loader import (
@@ -34,6 +35,7 @@ from data_loader import (
 )
 from gui.chart_canvas import MyFigureCanvas
 from gui.drawing_tools import DrawingToolsMixin
+from gui.auto_data import AutoDataMixin
 from gui.download_dialog import DownloadDialog
 from gui.scan_thread import ScanFolderThread
 from gui.precompute_thread import PrecomputeIndicatorsThread
@@ -46,7 +48,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 matplotlib.use('QtAgg')
 
 
-class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
+class StockDoubleBlindTrainer(AutoDataMixin, DrawingToolsMixin, QMainWindow):
     ZOOM_STEP = config.ZOOM_STEP
     MIN_DISPLAY_COUNT = config.MIN_DISPLAY_COUNT
     # 分钟级周期（分时图仅对这些周期可用）
@@ -71,6 +73,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.current_period: str = 'D'
         self.current_datetime: Optional[datetime] = None
         self.history_end_datetime: Optional[datetime] = None
+        self._training_end_datetime: Optional[datetime] = None
         self._pending_period_switch: Optional[Dict] = None
         self.period_buttons: Dict[str, QPushButton] = {}
 
@@ -107,6 +110,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         # 光标使用 Matplotlib blit 单独刷新，避免鼠标移动时重建整张图。
         self.cursor_artists: Dict[str, Any] = {}
         self._cursor_backgrounds: Dict[Any, Any] = {}
+        self._indicator_header_artists = {}
+        self._indicator_header_strips = {}
 
         # 光标模式
         self.cursor_mode = False
@@ -127,6 +132,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.progress_dialog: Optional[QProgressDialog] = None
 
         self.initUI()
+        self._init_auto_data()
 
     # ----------------- 初始化 UI -----------------
     def _load_settings(self):
@@ -138,6 +144,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.saved_short = self.settings.value("short", False, type=bool)
 
     def _save_settings(self):
+        self.settings.setValue('local_data_roots', [root for root in self._auto_search_roots
+                                                   if root != os.path.dirname(os.path.dirname(__file__))])
         self.settings.setValue("initial_capital", float(self.le_initial_capital.text()))
         self.settings.setValue("fee_rate", float(self.le_fee_rate.text()))
         self.settings.setValue("hide_date", self.cb_hide_date.isChecked())
@@ -206,6 +214,24 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             QScrollBar:vertical { background: #0B0E11; width: 9px; }
             QScrollBar::handle:vertical { background: #343B44; border-radius: 4px; min-height: 30px; }
             QStatusBar { background: #090C0F; color: #6F7883; border-top: 1px solid #20252B; }
+            QWidget#terminalPage { background: #000000; }
+            QWidget#terminalPage QFrame#chartCard, QWidget#terminalPage QFrame#tradeBar,
+            QWidget#terminalPage QFrame#historyCard, QFrame#marketQuote {
+                background: #050607; border: 1px solid #5C2529; border-radius: 0;
+            }
+            QWidget#terminalPage QPushButton { min-height: 24px; padding: 0 5px; border-radius: 2px; font-size: 11px; }
+            QWidget#terminalPage QPushButton#periodBtn { min-height: 23px; max-height: 23px; padding: 0 5px; }
+            QWidget#terminalPage QPushButton#periodBtn:checked { background: #642D33; color: #FFE6E6; }
+            QWidget#terminalPage QPushButton#buyBtn { background: #9A3037; border-color: #BE424B; }
+            QWidget#terminalPage QPushButton#sellBtn { background: #117A82; border-color: #23AAB4; }
+            QWidget#terminalPage QLineEdit, QWidget#terminalPage QSpinBox,
+            QWidget#terminalPage QComboBox, QWidget#terminalPage QDoubleSpinBox {
+                min-height: 24px; padding: 0 4px; border-radius: 2px;
+            }
+            QWidget#terminalPage QLabel#metricHero { font-size: 17px; color: #F0D97A; }
+            QWidget#terminalPage QTabWidget::pane { border: 1px solid #5C2529; background: #000000; }
+            QWidget#terminalPage QTabBar::tab { background: #171B20; padding: 5px 12px; color: #949DA8; }
+            QWidget#terminalPage QTabBar::tab:selected { background: #642D33; color: #FFFFFF; }
         """)
 
         central_widget = QWidget()
@@ -226,8 +252,11 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
 
     def _init_setup_workspace(self):
         """开局页：先完成数据与训练参数，再进入交易工作区。"""
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        content = QWidget()
+        page.setWidget(content)
+        page_layout = QVBoxLayout(content)
         page_layout.setContentsMargins(22, 18, 22, 18)
         page_layout.addStretch(1)
 
@@ -274,33 +303,49 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
     def _init_trading_workspace(self):
         """训练页：图表、交易控制和账户表现集中在同一屏。"""
         page = QWidget()
+        page.setObjectName('terminalPage')
         main_layout = QHBoxLayout(page)
-        main_layout.setContentsMargins(9, 8, 9, 7)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(2, 2, 2, 2)
+        main_layout.setSpacing(2)
 
         left_main_layout = QVBoxLayout()
-        left_main_layout.setSpacing(7)
+        left_main_layout.setSpacing(0)
         main_layout.addLayout(left_main_layout, 1)
         self._init_chart_panel(left_main_layout)
 
         side = QVBoxLayout()
-        side.setSpacing(8)
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(3)
+        self._init_market_quote_panel(side)
+        self._init_trade_panel(side)
+        self.sidebar_tabs = QTabWidget()
+        account_page = QWidget()
+        account_layout = QVBoxLayout(account_page)
+        account_layout.setContentsMargins(0, 0, 0, 0)
+        self._init_status_panel(account_layout)
+        account_layout.addStretch()
+        history_page = QWidget()
+        history_layout = QVBoxLayout(history_page)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        self._init_history_panel_new(history_layout)
+        self.sidebar_tabs.addTab(account_page, '账户 / 持仓')
+        self.sidebar_tabs.addTab(history_page, '成交记录')
+        side.addWidget(self.sidebar_tabs, 1)
+        session_buttons = QHBoxLayout()
         self.btn_end_session = QPushButton('结束本轮')
         self.btn_end_session.setObjectName('resetBtn')
         self.btn_end_session.clicked.connect(self.finish_session)
-        side.addWidget(self.btn_end_session)
-        self._init_trade_panel(side)
-        self._init_status_panel(side)
-        self._init_history_panel_new(side)
+        session_buttons.addWidget(self.btn_end_session)
         self.btn_new_session = QPushButton('新一轮训练')
         self.btn_new_session.clicked.connect(lambda: self.reset_training(keep_data=True))
-        side.addWidget(self.btn_new_session)
+        session_buttons.addWidget(self.btn_new_session)
+        side.addLayout(session_buttons)
         side_widget = QWidget()
         side_widget.setLayout(side)
         self.trading_sidebar = QScrollArea()
         self.trading_sidebar.setWidgetResizable(True)
         self.trading_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.trading_sidebar.setFixedWidth(380)
+        self.trading_sidebar.setFixedWidth(268)
         self.trading_sidebar.setWidget(side_widget)
         main_layout.addWidget(self.trading_sidebar)
 
@@ -310,17 +355,17 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
     def _init_top_bar(self, parent_layout: QVBoxLayout):
         top_bar = QFrame()
         top_bar.setObjectName('topBar')
-        top_bar.setFixedHeight(50)
+        top_bar.setFixedHeight(36)
         layout = QHBoxLayout(top_bar)
-        layout.setContentsMargins(15, 5, 13, 5)
+        layout.setContentsMargins(10, 2, 10, 2)
 
         brand = QLabel('STOCKLAB')
         brand.setObjectName('brandLabel')
         layout.addWidget(brand)
-        subtitle = QLabel('历史行情回放训练')
+        subtitle = QLabel('复盘训练')
         subtitle.setObjectName('mutedLabel')
         layout.addWidget(subtitle)
-        layout.addSpacing(18)
+        layout.addSpacing(8)
 
         self.lbl_cur_stock = QLabel('等待载入行情')
         self.lbl_cur_stock.setObjectName('symbolLabel')
@@ -344,22 +389,22 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         chart_group = QFrame()
         chart_group.setObjectName('chartCard')
         chart_layout = QVBoxLayout(chart_group)
-        chart_layout.setContentsMargins(9, 8, 9, 7)
-        chart_layout.setSpacing(5)
+        chart_layout.setContentsMargins(2, 2, 2, 2)
+        chart_layout.setSpacing(2)
 
         heading_row = QHBoxLayout()
-        heading = QLabel('价格走势')
+        heading = QLabel('行情回放')
         heading.setObjectName('sectionTitle')
         heading_row.addWidget(heading)
         heading_row.addStretch()
         self.lbl_chart_quote = QLabel('O --   H --   L --   C --   VOL --')
         self.lbl_chart_quote.setObjectName('quoteBar')
-        heading_row.addWidget(self.lbl_chart_quote)
-        chart_layout.addLayout(heading_row)
+        self.lbl_chart_quote.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        heading_row.addWidget(self.lbl_chart_quote, 1)
 
         period_layout = QHBoxLayout()
         period_layout.setSpacing(2)
-        periods = ['1分钟', '5分钟', '15分钟', '20分钟', '30分钟', '60分钟', '日线', '周线', '月线']
+        periods = ['1分', '5分', '15分', '20分', '30分', '60分', '日', '周', '月']
         period_keys = ['1min', '5min', '15min', '20min', '30min', '60min', 'D', 'W', 'M']
         for text, key in zip(periods, period_keys):
             btn = QPushButton(text)
@@ -380,10 +425,20 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         period_layout.addSpacing(6)
         period_layout.addWidget(self.btn_fenshi)
         period_layout.addStretch()
+        for title, callback, tip in [('←', self._pan_left, '向左平移图表'),
+                                      ('→', self._pan_right, '向右平移图表'),
+                                      ('＋', self._zoom_in, '放大图表'),
+                                      ('－', self._zoom_out, '缩小图表'),
+                                      ('最新', self._focus_latest_chart, '回到当前已揭示K线')]:
+            button = QPushButton(title)
+            button.setObjectName('periodBtn')
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _, action=callback: action())
+            period_layout.addWidget(button)
         chart_layout.addLayout(period_layout)
         tools = QHBoxLayout()
         self.indicator_checks = {}
-        for name, checked in [('MA', True), ('成交量', True), ('MACD', False)]:
+        for name, checked in [('MA', True), ('成交量', True), ('MACD', True)]:
             check = QCheckBox(name)
             check.setChecked(checked)
             check.toggled.connect(lambda _: self._draw_combined_chart())
@@ -401,6 +456,10 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             tools.addWidget(button)
             self.drawing_buttons[mode] = button
         self.drawing_buttons['cursor'].setChecked(True)
+        self.btn_drawing_settings = QPushButton('画线设置')
+        self.btn_drawing_settings.setCheckable(True)
+        self.btn_drawing_settings.setObjectName('periodBtn')
+        tools.addWidget(self.btn_drawing_settings)
         tools.addStretch()
         shot = QPushButton('截图')
         shot.clicked.connect(self.export_chart)
@@ -447,7 +506,13 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         clear.clicked.connect(self.clear_drawings)
         drawing_tools.addWidget(clear)
         drawing_tools.addStretch()
-        chart_layout.addLayout(drawing_tools)
+        self.drawing_settings_panel = QWidget()
+        self.drawing_settings_panel.setLayout(drawing_tools)
+        drawing_tools.setContentsMargins(0, 0, 0, 0)
+        self.drawing_settings_panel.hide()
+        self.btn_drawing_settings.toggled.connect(self.drawing_settings_panel.setVisible)
+        chart_layout.addWidget(self.drawing_settings_panel)
+        chart_layout.addLayout(heading_row)
         self._update_drawing_controls()
         self.period_buttons['D'].setChecked(True)
 
@@ -456,10 +521,14 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.canvas.mpl_connect('draw_event', self._on_chart_draw)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.canvas.setMinimumHeight(280)
-        chart_layout.addWidget(self.canvas)
+        chart_layout.addWidget(self.canvas, 1)
+        self.lbl_chart_navigation = QLabel('Ctrl＋滚轮：鼠标处缩放  |  ← →：平移图表  |  F10：下一根')
+        self.lbl_chart_navigation.setObjectName('mutedLabel')
+        self.lbl_chart_navigation.setFixedHeight(18)
+        chart_layout.addWidget(self.lbl_chart_navigation)
 
         self.fig.clear()
-        self.fig.patch.set_facecolor('#0D1116')
+        self.fig.patch.set_facecolor('#000000')
         gs = self.fig.add_gridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.02)
         self.ax_kline = self.fig.add_subplot(gs[0, 0])
         self.ax_volume = self.fig.add_subplot(gs[1, 0], sharex=self.ax_kline)
@@ -468,7 +537,53 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.ax_volume.set_visible(False)
         self.ax_macd.set_visible(False)
 
-        parent_layout.addWidget(chart_group)
+        parent_layout.addWidget(chart_group, 1)
+
+    def _focus_latest_chart(self):
+        if not self._check_training_active():
+            return
+        count = max(self.MIN_DISPLAY_COUNT, self.display_end_idx - self.display_start_idx + 1)
+        self.display_end_idx = self.current_date_idx
+        self.display_start_idx = max(0, self.display_end_idx - count + 1)
+        self._draw_combined_chart()
+
+    def _init_market_quote_panel(self, parent_layout):
+        panel = QFrame()
+        panel.setObjectName('marketQuote')
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+        self.lbl_quote_symbol = QLabel('等待行情')
+        self.lbl_quote_symbol.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_quote_symbol.setStyleSheet('color: #F1D36A; font-size: 15px; font-weight: bold;')
+        layout.addWidget(self.lbl_quote_symbol)
+        self.lbl_quote_time = QLabel('--')
+        self.lbl_quote_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_quote_time.setObjectName('mutedLabel')
+        layout.addWidget(self.lbl_quote_time)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(5)
+        grid.setVerticalSpacing(5)
+        self.quote_values = {}
+        for row, fields in enumerate([(('现价', 'close'), ('开盘', 'open')),
+                                     (('涨跌', 'change'), ('涨跌幅', 'pct')),
+                                     (('最高', 'high'), ('最低', 'low')),
+                                     (('前收', 'previous'), ('成交量', 'volume'))]):
+            for column, (caption, key) in enumerate(fields):
+                label = QLabel(caption)
+                label.setObjectName('mutedLabel')
+                value = QLabel('--')
+                value.setAlignment(Qt.AlignmentFlag.AlignRight)
+                grid.addWidget(label, row, column * 2)
+                grid.addWidget(value, row, column * 2 + 1)
+                self.quote_values[key] = value
+        self.quote_values['previous'].setToolTip('上一根已揭示K线的收盘价；首根以开盘价作比较基准')
+        self.quote_values['volume'].setToolTip('数据源的原始成交量单位；不推测流通盘、换手率等未提供字段')
+        layout.addLayout(grid)
+        note = QLabel('当前已揭示K线 · 涨跌对比前一根')
+        note.setObjectName('mutedLabel')
+        layout.addWidget(note)
+        parent_layout.addWidget(panel)
 
     def toggle_playback(self):
         if self.play_timer.isActive():
@@ -624,6 +739,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
                 'name': self.imported_stock_name, 'code': self.imported_stock_code,
                 'current': self.current_date_idx, 'history_end': self.history_end_idx,
                 'cutoff': str(self.current_datetime), 'history_cutoff': str(self.history_end_datetime),
+                'training_end': str(self._training_end_datetime or self.de_end_date.dateTime().toPyDateTime()),
                 'display': [self.display_start_idx, self.display_end_idx],
                 'finished': self.session_finished, 'drawings': self.drawings,
                 'hide_date': self.cb_hide_date.isChecked(), 'hide_stock': self.cb_hide_stock.isChecked(),
@@ -659,6 +775,10 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             history_cutoff = pd.Timestamp(payload.get('history_cutoff', data.index[max(0, payload['history_end'])]))
             if pd.isna(cutoff) or pd.isna(history_cutoff) or history_cutoff > cutoff:
                 raise ValueError('存档时间边界错误')
+            if payload.get('training_end') is not None:
+                training_end = pd.Timestamp(payload['training_end'])
+                if pd.isna(training_end) or training_end < cutoff:
+                    raise ValueError('存档训练结束时间错误')
             left, right = payload['display']
             if not (0 <= left <= right <= payload['current']):
                 raise ValueError('存档图表范围错误')
@@ -733,6 +853,13 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.session_finished = payload['finished']
         self.drawings = payload['drawings']
         self.reset_drawing_interaction()
+        fallback_end = self.imported_data.index[-1]
+        if not self.source_period_key.endswith('min'):
+            fallback_end = fallback_end.normalize() + pd.Timedelta(hours=23, minutes=59)
+        self._training_end_datetime = pd.Timestamp(payload.get('training_end', fallback_end)).to_pydatetime()
+        self.de_end_date.blockSignals(True)
+        self.de_end_date.setDateTime(QDateTime(self._training_end_datetime))
+        self.de_end_date.blockSignals(False)
         self.cursor_mode = True
         self.cursor_abs_idx = self.current_date_idx
         self._cursor_price = None
@@ -806,7 +933,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         parent_layout.addWidget(base_group)
 
     def _init_date_config(self, parent_layout: QVBoxLayout):
-        date_group = QGroupBox("回放起点")
+        date_group = QGroupBox('训练时间与周期')
         self.date_group = date_group
         date_grid = QGridLayout(date_group)
         date_grid.addWidget(QLabel("开始时间："), 0, 0)
@@ -815,15 +942,29 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.de_start_date.setCalendarPopup(True)
         date_grid.addWidget(self.de_start_date, 0, 1, 1, 2)
 
+        date_grid.addWidget(QLabel('结束时间：'), 1, 0)
+        self.de_end_date = QDateTimeEdit(QDateTime.currentDateTime())
+        self.de_end_date.setDisplayFormat('yyyy-MM-dd HH:mm')
+        self.de_end_date.setCalendarPopup(True)
+        date_grid.addWidget(self.de_end_date, 1, 1, 1, 2)
+        date_grid.addWidget(QLabel('训练周期：'), 2, 0)
+        self.cb_training_period = QComboBox()
+        self.cb_training_period.addItem('自动（本地原周期 / 在线5分钟）', 'auto')
+        for key, title in DownloadDialog.PERIODS:
+            self.cb_training_period.addItem(title, key)
+        date_grid.addWidget(self.cb_training_period, 2, 1, 1, 2)
+
         self.btn_random_start = QPushButton("随机片段")
         self.btn_random_start.setToolTip("随机选择一个至少保留60根历史K线的训练起点")
         self.btn_random_start.clicked.connect(self._choose_random_start)
-        date_grid.addWidget(self.btn_random_start, 1, 1, 1, 2)
+        date_grid.addWidget(self.btn_random_start, 3, 1, 1, 2)
 
-        info_label = QLabel("起点后的行情会隐藏，点击“下一根”逐步揭示。")
+        info_label = QLabel('点击开始训练后检索本地与下载缓存；缺少数据时选择本地导入或网上获取。\n'
+                            '起点前行情用于指标，训练不会推进到结束时间之后。')
         info_label.setWordWrap(True)
+        info_label.setMinimumHeight(40)
         info_label.setStyleSheet("color: gray; font-size: 9px;")
-        date_grid.addWidget(info_label, 2, 0, 1, 3)
+        date_grid.addWidget(info_label, 4, 0, 1, 3)
 
         parent_layout.addWidget(date_group)
 
@@ -844,14 +985,14 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.data_group = data_group
         data_layout = QVBoxLayout(data_group)
 
-        self.lbl_data_path = QLabel("当前：未加载数据，请先导入")
+        self.lbl_data_path = QLabel("先设置股票、时间和周期，再点击开始训练检索数据")
         self.lbl_data_path.setWordWrap(True)
         self.lbl_data_path.setObjectName("dataBadge")
 
         self.lbl_source_status = QLabel("● 尚未载入")
         self.lbl_source_status.setObjectName("sourceBadge")
 
-        self.btn_import_data = QPushButton("导入本地")
+        self.btn_import_data = QPushButton("单文件导入")
         self.btn_import_data.setToolTip("自动识别 CSV/TXT/TSV/DAY 的编码、表头与K线周期")
         self.btn_import_data.clicked.connect(self.import_single_file)
 
@@ -860,8 +1001,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.btn_download_online.setToolTip("从多个免费行情源下载并自动缓存到本地")
         self.btn_download_online.clicked.connect(self.download_online_data)
 
-        self.btn_select_tdx_raw = QPushButton("扫描通达信数据目录")
-        self.btn_select_tdx_raw.setToolTip("递归扫描 vipdoc 或通达信导出目录，可随机抽取股票训练")
+        self.btn_select_tdx_raw = QPushButton('本地导入（文件夹）')
+        self.btn_select_tdx_raw.setToolTip('选择文件夹并递归扫描 CSV/TXT/TSV/DAY；开始训练时检索这些目录')
         self.btn_select_tdx_raw.clicked.connect(self.select_tdx_raw_folder)
 
         self.lbl_tdx_folder = QLabel("未选择原始数据文件夹")
@@ -884,6 +1025,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.btn_clear_data.setObjectName("dangerBtn")
         self.btn_clear_data.clicked.connect(self.clear_imported_data)
         self.btn_clear_data.setEnabled(False)
+        self.btn_auto_cancel = QPushButton('取消数据准备')
+        self.btn_auto_cancel.hide()
 
         data_layout.addWidget(self.lbl_source_status)
         data_layout.addWidget(self.lbl_data_path)
@@ -896,6 +1039,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         data_layout.addWidget(self.cb_random_stock)
         data_layout.addWidget(self.cb_specific_stock)
         data_layout.addWidget(self.le_stock_code)
+        data_layout.addWidget(self.btn_auto_cancel)
         data_layout.addWidget(self.btn_clear_data)
 
         parent_layout.addWidget(data_group)
@@ -935,16 +1079,17 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.status_group = status_group
         outer = QVBoxLayout(status_group)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(10)
+        outer.setSpacing(3)
         holdings = QFrame()
         holdings.setObjectName('chartCard')
         holding_layout = QVBoxLayout(holdings)
-        holding_layout.setContentsMargins(16, 14, 16, 14)
+        holding_layout.setContentsMargins(7, 6, 7, 6)
+        holding_layout.setSpacing(4)
         title = QLabel('持仓概览')
         title.setObjectName('sectionTitle')
         holding_layout.addWidget(title)
         grid = QGridLayout()
-        grid.setVerticalSpacing(10)
+        grid.setVerticalSpacing(4)
         for row, captions in enumerate([('数量', '成本'), ('市价', '浮动盈亏')]):
             for column, caption in enumerate(captions):
                 label = QLabel(caption)
@@ -965,7 +1110,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         account = QFrame()
         account.setObjectName('chartCard')
         account_layout = QVBoxLayout(account)
-        account_layout.setContentsMargins(16, 14, 16, 14)
+        account_layout.setContentsMargins(7, 6, 7, 6)
+        account_layout.setSpacing(4)
         equity_caption = QLabel('总权益')
         equity_caption.setObjectName('mutedLabel')
         account_layout.addWidget(equity_caption)
@@ -974,8 +1120,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         account_layout.addWidget(self.lbl_total_asset)
 
         status_layout = QGridLayout()
-        status_layout.setHorizontalSpacing(12)
-        status_layout.setVerticalSpacing(8)
+        status_layout.setHorizontalSpacing(5)
+        status_layout.setVerticalSpacing(4)
         status_layout.addWidget(QLabel("可用资金"), 0, 0)
         self.lbl_cur_cash = QLabel("0.00 元")
         self.lbl_cur_cash.setObjectName('metricValue')
@@ -1000,8 +1146,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         trade_group = QFrame()
         trade_group.setObjectName('tradeBar')
         trade_layout = QVBoxLayout(trade_group)
-        trade_layout.setContentsMargins(12, 12, 12, 12)
-        trade_layout.setSpacing(10)
+        trade_layout.setContentsMargins(7, 6, 7, 6)
+        trade_layout.setSpacing(5)
         buttons = QHBoxLayout()
         self.btn_next = QPushButton('下一根 →')
         self.btn_next.setShortcut('F10')
@@ -1100,13 +1246,14 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
     def select_tdx_raw_folder(self):
         folder_path = QFileDialog.getExistingDirectory(
             self,
-            "选择包含 .day 或 .txt 股票数据的文件夹（会递归搜索子文件夹）",
+            '选择股票数据目录（递归检索 CSV/TXT/TSV/DAY）',
             "",
             QFileDialog.Option.ShowDirsOnly
         )
         if not folder_path:
             return
 
+        self._remember_data_root(folder_path, directory=True)
         self.progress_dialog = QProgressDialog("正在扫描文件夹...", "取消", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dialog.setMinimumDuration(0)
@@ -1132,14 +1279,13 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.raw_stock_files = stock_files
         self.stock_names = stock_names
         folder_path = self.scan_thread.folder_path
+        self._remember_data_root(folder_path, directory=True)
         self.lbl_tdx_folder.setText(f"原始数据文件夹：{folder_path}\n(找到 {len(stock_files)} 个有效文件)")
         self.lbl_tdx_folder.setStyleSheet("color: blue; font-size: 9px;")
         self.scan_thread = None
 
-        txt_count = sum(1 for v in stock_files.values() if v[2] == 'txt')
-        day_count = len(stock_files) - txt_count
         QMessageBox.information(self, "扫描完成",
-                                f"找到 {txt_count} 个有效 .txt 文件, {day_count} 个 .day 文件\n"
+                                f'找到 {len(stock_files)} 个 CSV/TXT/TSV/DAY 行情文件\n'
                                 f"已加载 {len(stock_names)} 个股票名称")
 
         # 注意：不要清空已导入的分钟数据
@@ -1161,6 +1307,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             if hasattr(self, '_user_target_datetime'):
                 del self._user_target_datetime
             df, code, name, period_key = load_market_data_file(file_path)
+            self._remember_data_root(file_path)
+            self.cancel_auto_data()
             self._exit_fenshi_mode()
             self.imported_data = df
             self.imported_stock_name = name
@@ -1199,6 +1347,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
 
     def download_online_data(self):
         """打开在线下载对话框，成功后按分钟/日线分别初始化数据"""
+        self.cancel_auto_data()
         dlg = DownloadDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_df is None:
             return
@@ -1262,15 +1411,32 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
 
         start_qt = QDateTime(df.index[0].to_pydatetime())
         end_qt = QDateTime(df.index[-1].to_pydatetime())
-        self.de_start_date.setDateTimeRange(start_qt, end_qt)
+        # Manual import chooses the imported stock, but does not restrict future
+        # date selections to this file's coverage: those can trigger a download.
+        controls = (self.de_start_date, self.de_end_date, self.cb_specific_stock,
+                    self.cb_random_stock, self.le_stock_code)
+        for control in controls:
+            control.blockSignals(True)
         # 仅在当前选择超出新数据范围时才重置为数据中点，
         # 不覆盖用户已选择的起始时间
         if not (start_qt <= self.de_start_date.dateTime() <= end_qt):
             mid_idx = len(df) // 2
             mid_qt = QDateTime(df.index[mid_idx].to_pydatetime())
             self.de_start_date.setDateTime(mid_qt)
+        self.de_end_date.setDateTime(end_qt if self.source_period_key.endswith('min')
+                                     else end_qt.addSecs(23 * 3600 + 59 * 60))
+        if validate_stock_code(stock_code):
+            self.le_stock_code.setText(stock_code)
+            self.cb_specific_stock.setChecked(True)
+            self.le_stock_code.setEnabled(True)
+        for control in controls:
+            control.blockSignals(False)
+        self._auto_ready_request = None
 
     def clear_imported_data(self):
+        self.cancel_auto_data()
+        self._auto_ready_request = None
+        self._auto_result = None
         self.drawings = []
         self.reset_drawing_interaction()
         self.raw_min_data = None
@@ -1283,7 +1449,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.imported_data = None
         self.imported_stock_name = ""
         self.imported_stock_code = ""
-        self.lbl_data_path.setText("当前：未加载数据，请先导入")
+        self.lbl_data_path.setText("先设置股票、时间和周期，再点击开始训练检索数据")
         self.lbl_source_status.setText("● 尚未载入")
         self.lbl_source_status.setStyleSheet("color: #F59E0B; font-weight: 600;")
         self.lbl_cur_stock.setText("等待载入行情")
@@ -1571,8 +1737,11 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.stock_data.loc[row, ['Open', 'High', 'Low', 'Close', 'Volume']] = [
             subset.Open.iloc[0], subset.High.max(), subset.Low.min(), subset.Close.iloc[-1], subset.Volume.sum()]
         close = self.stock_data.Close
-        for length in (5, 10, 20, 60):
+        for length in (5, 10, 20, 60, 120, 250):
             self.stock_data[f'MA{length}'] = close.rolling(length, min_periods=1).mean()
+        volume = self.stock_data.get('Volume', pd.Series(0.0, index=self.stock_data.index))
+        for length in (5, 10):
+            self.stock_data[f'VOLMA{length}'] = volume.rolling(length, min_periods=1).mean()
         self.stock_data['DIF'] = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
         self.stock_data['DEA'] = self.stock_data.DIF.ewm(span=9, adjust=False).mean()
         self.stock_data['MACD'] = 2 * (self.stock_data.DIF - self.stock_data.DEA)
@@ -1651,104 +1820,27 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
     # ----------------- 训练控制 -----------------
     def start_training(self):
         self.stop_playback()
-        # 优先使用已导入的单个文件数据
-        if self.imported_data is not None:
-            df = self.imported_data
-            stock_name = self.imported_stock_name
-            stock_code = self.imported_stock_code
-        elif self.raw_stock_files:
-            if self.cb_random_stock.isChecked():
-                display_name = random.choice(list(self.raw_stock_files.keys()))
-                file_path, stock_code, file_type = self.raw_stock_files[display_name]
-            elif self.cb_specific_stock.isChecked():
-                code = self.le_stock_code.text().strip()
-                if not validate_stock_code(code):
-                    QMessageBox.warning(self, "错误", "请输入正确的6位数字股票代码！")
-                    return
-                matched = None
-                for disp_name, (path, scode, ftype) in self.raw_stock_files.items():
-                    if scode == code:
-                        matched = disp_name
-                        file_path = path
-                        stock_code = scode
-                        file_type = ftype
-                        break
-                if not matched:
-                    QMessageBox.warning(self, "错误", f"未找到股票代码 {code} 的 .txt 或 .day 文件！")
-                    return
-            else:
-                QMessageBox.warning(self, "错误", "请选择股票选择方式（随机或指定代码）！")
-                return
-
-            try:
-                df, code, name = load_stock_data_file(file_path, file_type)
-                if df is None or df.empty:
-                    raise ValueError("解析后的数据为空")
-                if not name and code in self.stock_names:
-                    name = self.stock_names[code]
-                stock_name = name
-                stock_code = code
-            except Exception as e:
-                logger.error(f"加载文件失败 {file_path}: {e}", exc_info=True)
-                QMessageBox.critical(self, "加载失败", f"无法解析文件：{file_path}\n错误：{str(e)}")
-                return
-        else:
-            QMessageBox.warning(self, "错误", "请先导入数据（单个文件或扫描文件夹）！")
-            return
-
         try:
+            request = self._auto_request()
             initial_capital = float(self.le_initial_capital.text())
             fee_rate = float(self.le_fee_rate.text())
-            if initial_capital <= 0:
+            if not np.isfinite(initial_capital) or initial_capital <= 0:
                 raise ValueError("初始资金必须大于0")
-            if fee_rate < 0 or fee_rate > 1:
+            if not np.isfinite(fee_rate) or fee_rate < 0 or fee_rate > 1:
                 raise ValueError("费率必须在0-1之间")
-
-            qdt = self.de_start_date.dateTime()
-            user_target_datetime = qdt.toPyDateTime()
-
-            # 根据数据来源决定处理方式
-            if self.is_min_data:
-                # 分钟数据（可能是之前导入的，也可能是通过文件夹加载的分钟数据？但文件夹扫描不加载具体数据，所以这里一般指之前导入的）
-                self.raw_min_data = df if self.raw_min_data is None else self.raw_min_data
-                self.imported_data = df
-                self.imported_stock_name = stock_name
-                self.imported_stock_code = stock_code
-                self._user_target_datetime = user_target_datetime
-                # 记录用户选择的精确起始时刻：首次切换到分钟周期时按此定位，
-                # 否则选择的时间会被丢弃（日线定位只用日期，永远从当天第一根K线开始）
-                self._user_exact_target = user_target_datetime
-                self._user_target_pending = True
-                self.period_data_cache.clear()
-                # 按原始分钟周期训练，不能丢弃用户选定的分钟时间。
-                self.stock_data_raw = self.raw_min_data
-                self.current_period = self.source_period_key
-                self.period_data_cache[self.current_period] = self.raw_min_data
-                self._set_checked_period(self.current_period)
-                self._update_fenshi_button_state()
-                self._user_target_pending = False
-                self._precompute_indicators_async()
-            else:
-                # 日线数据
-                self.stock_data_raw = df
-                self.imported_data = df
-                self.imported_stock_name = stock_name
-                self.imported_stock_code = stock_code
-                self.period_data_cache['D'] = df
-                self.current_period = 'D'
-                self.period_buttons['D'].setChecked(True)
-                self._update_fenshi_button_state()
-                self._user_target_datetime = user_target_datetime
-                self._user_exact_target = None
-                self._user_target_pending = False
-                self._precompute_indicators_async()
-
-            self._set_trade_buttons_enabled(False)
+            self._auto_start_request = request
+            self._auto_allow_online = False
+            self._auto_missing = None
+            self._auto_ready_request = None
+            self._auto_result = None
+            self._auto_timer.stop()
             self.btn_start.setEnabled(False)
-
+            self._prepare_auto_data()
         except ValueError as e:
+            self.btn_start.setEnabled(True)
             QMessageBox.warning(self, "参数错误", str(e))
         except Exception as e:
+            self.btn_start.setEnabled(True)
             logger.error(f"启动训练时发生错误: {e}", exc_info=True)
             QMessageBox.critical(self, "系统错误", f"启动训练时发生错误：{str(e)}")
 
@@ -1759,7 +1851,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             if self.stock_data.index.empty:
                 raise ValueError("股票数据索引为空")
 
-            required_cols = ['MA5', 'MA10', 'MA20', 'MA60', 'DIF', 'DEA', 'MACD']
+            required_cols = ['MA5', 'MA10', 'MA20', 'MA60', 'MA120', 'MA250',
+                             'VOLMA5', 'VOLMA10', 'DIF', 'DEA', 'MACD']
             missing = [col for col in required_cols if col not in self.stock_data.columns]
             if missing:
                 raise ValueError(f"指标列缺失: {missing}")
@@ -2084,6 +2177,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             self.current_date = self.trading_days[self.current_date_idx]
             if self.current_period in ('D', 'W', 'M'):
                 self.current_date = pd.Timestamp(self.current_date) + pd.Timedelta(hours=15)
+            if self._training_end_datetime is not None:
+                self.current_date = min(pd.Timestamp(self.current_date), pd.Timestamp(self._training_end_datetime))
             self.current_datetime = self.current_date
             self._apply_revealed_aggregate(self.current_datetime)
             self._adjust_display_to_include_current()
@@ -2296,6 +2391,8 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
 
     def _on_chart_draw(self, event):
         """每次整图重绘（包括窗口缩放/DPI变化）重建不含光标的背景。"""
+        if self.canvas.is_saving():
+            return
         self._cache_cursor_backgrounds()
         if self.cursor_artists and self.stock_data is not None:
             self._update_cursor_overlay()
@@ -2341,13 +2438,15 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             if visible and ax.get_visible():
                 for artist in artists:
                     ax.draw_artist(artist)
+        self._paint_indicator_headers()
         self._paint_drawing_overlay()
         self.canvas.blit(self.fig.bbox)
 
     def _update_chart_quote_at(self, idx: int):
         """更新图表顶部的紧凑 OHLCV 行情信息。"""
-        if self.stock_data is None or idx < 0 or idx >= len(self.stock_data):
+        if self.stock_data is None or idx < 0 or idx > self.current_date_idx or idx >= len(self.stock_data):
             return
+        self._update_indicator_headers(idx)
         row = self.stock_data.iloc[idx]
         previous = float(self.stock_data['Close'].iat[idx - 1]) if idx > 0 else float(row['Open'])
         change = float(row['Close']) - previous
@@ -2437,14 +2536,15 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             self.close_lines = []
 
             for ax in [self.ax_kline, self.ax_volume, self.ax_macd]:
-                ax.set_facecolor('#0D1116')
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.spines['bottom'].set_visible(False)
-                ax.spines['left'].set_visible(False)
-                ax.tick_params(axis='x', colors='#888888', labelsize=8)
-                ax.tick_params(axis='y', colors='#888888', labelsize=8)
-                ax.grid(True, alpha=0.22, color='#343A42', linewidth=0.6)
+                ax.set_facecolor('#000000')
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_color('#7B292E')
+                    spine.set_linewidth(.55)
+                ax.tick_params(axis='x', colors='#A4A4A4', labelsize=7, length=2, pad=2)
+                ax.tick_params(axis='y', colors=config.UP_COLOR, labelsize=7, length=2, pad=3)
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+                ax.grid(True, axis='y', alpha=.35, color='#4A4141', linewidth=.5, linestyle=':')
                 ax.yaxis.tick_right()
 
             x = np.arange(data_len)
@@ -2460,39 +2560,45 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             high_max = indicators['high'].max()
             price_padding = max((high_max - low_min) * .07, high_max * .001, .01)
             self.ax_kline.set_ylim(low_min - price_padding, high_max + price_padding)
-            if self.ax_kline.lines:
-                self.ax_kline.legend(loc='upper left', fontsize=7, facecolor='#11151A',
-                                      edgecolor='#30363D', labelcolor='linecolor')
             self.ax_kline.set_yticks(self.ax_kline.get_yticks()[1:-1])
 
             if show_volume:
                 self._draw_volume_collections(x, indicators)
             if show_macd:
                 self._draw_macd_collections(x, indicators)
+            self._create_indicator_headers()
             self._draw_annotations(start_idx, end_idx)
             current_price = self._get_current_price()
-            self.ax_kline.axhline(current_price, color='#00A88C', linestyle=':', linewidth=.7)
+            latest = self.stock_data.iloc[self.current_date_idx]
+            price_color = config.UP_COLOR if latest['Close'] >= latest['Open'] else config.DOWN_COLOR
+            self.ax_kline.axhline(current_price, color=price_color, linestyle=':', linewidth=.6, alpha=.65)
             self.ax_kline.text(1, current_price, f' {current_price:.2f} ',
                 transform=self.ax_kline.get_yaxis_transform(), color='white', fontsize=8,
-                va='center', bbox={'facecolor': '#008C76', 'edgecolor': 'none'}, clip_on=False)
+                va='center', bbox={'facecolor': price_color, 'edgecolor': 'none'}, clip_on=False)
 
             self.ax_kline.set_xlim(-0.5, data_len - 0.5)
             count = int(show_volume) + int(show_macd)
-            bottom = .075
-            panel_height = .15 if count else 0
+            bottom = .045
+            panel_height = .185 if count == 2 else .22 if count else 0
             for axis, enabled in [(self.ax_macd, show_macd), (self.ax_volume, show_volume)]:
                 if enabled:
-                    axis.set_position([.015, bottom, .915, panel_height])
-                    bottom += panel_height + .025
-            self.ax_kline.set_position([.015, bottom, .915, .975 - bottom])
+                    axis.set_position([.008, bottom, .932, panel_height])
+                    bottom += panel_height + .008
+            self.ax_kline.set_position([.008, bottom, .932, .988 - bottom])
             tick_axis = self.ax_macd if show_macd else self.ax_volume if show_volume else self.ax_kline
             ticks = np.unique(np.linspace(0, data_len - 1, min(6, data_len), dtype=int))
             labels = [f'第 {start_idx + int(i) + 1} 根' if self.cb_hide_date.isChecked()
                       else self.stock_data.index[start_idx + int(i)].strftime(
                           '%m-%d %H:%M' if self.current_period.endswith('min') else '%Y-%m-%d') for i in ticks]
             tick_axis.set_xticks(ticks, labels)
+            tick_labels = tick_axis.get_xticklabels()
+            if len(tick_labels) > 1:
+                tick_labels[0].set_horizontalalignment('left')
+                tick_labels[-1].set_horizontalalignment('right')
             for axis in (self.ax_kline, self.ax_volume, self.ax_macd):
                 axis.tick_params(axis='x', labelbottom=axis is tick_axis)
+            self.lbl_chart_navigation.setText(
+                f'显示 {data_len} 根  |  Ctrl＋滚轮：鼠标处缩放  |  ← →：平移  |  F10：下一根')
 
             self._create_cursor_artists(start_idx, end_idx)
             self.canvas.draw()
@@ -2516,12 +2622,16 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             'ma10': slice_df['MA10'],
             'ma20': slice_df['MA20'],
             'ma60': slice_df['MA60'],
+            'ma120': slice_df['MA120'],
+            'ma250': slice_df['MA250'],
             'dif': slice_df['DIF'],
             'dea': slice_df['DEA'],
             'macd_bar': slice_df['MACD']
         }
 
     def _reset_collections(self):
+        self._indicator_header_artists = {}
+        self._indicator_header_strips = {}
         self.kline_lines = None
         self.kline_rects = None
         self.ma_lines.clear()
@@ -2565,6 +2675,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         segments = []
         rects = []
         colors = []
+        faces = []
 
         for i in range(len(x)):
             o = open_.iloc[i]
@@ -2587,6 +2698,7 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             )
             rects.append(rect)
             colors.append(color)
+            faces.append('none' if c >= o else color)
 
         if self.kline_lines is None:
             self.kline_lines = LineCollection(segments, colors=colors, linewidths=1)
@@ -2596,15 +2708,15 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             self.kline_lines.set_colors(colors)
 
         if self.kline_rects is None:
-            self.kline_rects = PatchCollection(rects, facecolor=colors, edgecolor=colors, linewidth=0.8)
+            self.kline_rects = PatchCollection(rects, facecolor=faces, edgecolor=colors, linewidth=0.8)
             self.ax_kline.add_collection(self.kline_rects)
         else:
             self.kline_rects.set_paths(rects)
-            self.kline_rects.set_facecolor(colors)
+            self.kline_rects.set_facecolor(faces)
             self.kline_rects.set_edgecolor(colors)
 
     def _draw_ma_lines(self, x, indicators):
-        ma_periods = [5, 10, 20, 60]
+        ma_periods = [5, 10, 20, 60, 120, 250]
         for period in ma_periods:
             key = f'ma{period}'
             if key not in indicators:
@@ -2631,15 +2743,22 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         colors = [config.UP_COLOR if c >= o else config.DOWN_COLOR
                   for c, o in zip(close, open_)]
 
-        self.volume_bars = self.ax_volume.bar(x, volume, width=config.VOLUME_WIDTH,
-                                               color=colors, alpha=0.8)
+        faces = ['none' if c >= o else config.DOWN_COLOR for c, o in zip(close, open_)]
+        self.volume_bars = self.ax_volume.bar(x, volume, width=config.KLINE_WIDTH,
+                                               color=faces, edgecolor=colors, linewidth=.6)
+        for period, color in [(5, config.MA_COLORS[5]), (10, config.MA_COLORS[10])]:
+            values = self.stock_data[f'VOLMA{period}'].loc[volume.index]
+            self.ax_volume.plot(x, values, color=color, linewidth=.7)
 
         if volume.max() > 0:
             self.ax_volume.set_ylim(0, volume.max() * 1.5)
         else:
             self.ax_volume.set_ylim(0, 1)
 
-        self.ax_volume.set_yticks([])
+        self.ax_volume.yaxis.set_major_locator(MaxNLocator(nbins=3, prune='both'))
+        self.ax_volume.yaxis.set_major_formatter(FuncFormatter(
+            lambda value, _: f'{value / 1e8:.1f}亿' if abs(value) >= 1e8 else
+            f'{value / 1e4:.1f}万' if abs(value) >= 1e4 else f'{value:g}'))
 
     def _draw_macd_collections(self, x, indicators):
         dif = indicators['dif']
@@ -2670,12 +2789,122 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
             else:
                 self.ax_macd.vlines(xi, bar, 0, colors=config.DOWN_COLOR, linewidth=1)
 
-        if self.ax_macd.lines:
-            self.ax_macd.legend(loc='upper left', fontsize=7, facecolor='#11151A',
-                                 edgecolor='#30363D', labelcolor='linecolor')
-        self.ax_macd.set_yticks([])
+        self.ax_macd.axhline(0, color='#646464', linewidth=.5, linestyle=':')
+        self.ax_macd.yaxis.set_major_locator(MaxNLocator(nbins=3))
+        self.ax_macd.margins(y=.20)
+
+    def _create_indicator_headers(self):
+        """Animated readouts share the clean cursor blit background."""
+        self._indicator_header_artists = {}
+        self._indicator_header_strips = {}
+
+        def header(axis, title, fields):
+            strip = Rectangle((0, .94), 1, .06, transform=axis.transAxes,
+                              facecolor='#000000', edgecolor='none', animated=True, zorder=29)
+            axis.add_patch(strip)
+            self._indicator_header_strips[axis] = strip
+            items = [(title, None, 2, '#B0B0B0')] + fields
+            self._indicator_header_artists[axis] = [
+                (label, column, decimals, axis.text(.005, .985, '', transform=axis.transAxes,
+                    va='top', fontsize=7, color=color, animated=True, zorder=30))
+                for label, column, decimals, color in items]
+
+        if self.view_mode == 'fenshi':
+            header(self.ax_kline, '分时', [('价格', 'Close', 2, '#D0D0D0')])
+        elif self.indicator_checks['MA'].isChecked():
+            header(self.ax_kline, 'MA (5,10,20,60,120,250)', [
+                (f'MA{number}', f'MA{period}', 2, config.MA_COLORS[period])
+                for number, period in enumerate((5, 10, 20, 60, 120, 250), 1)])
+        if self.ax_volume.get_visible():
+            header(self.ax_volume, 'VOL (5,10)', [('VOL', 'Volume', 0, '#D0D0D0'),
+                ('VOLUME', 'Volume', 0, '#E5D32A'), ('MAVOL1', 'VOLMA5', 1, '#D0D0D0'),
+                ('MAVOL2', 'VOLMA10', 1, '#E5D32A')])
+        if self.ax_macd.get_visible():
+            header(self.ax_macd, 'MACD (12,26,9)', [('DIF', 'DIF', 2, '#D0D0D0'),
+                ('DEA', 'DEA', 2, '#E5D32A'), ('MACD', 'MACD', 2, '#D947ED')])
+
+    def _update_indicator_headers(self, idx):
+        if not 0 <= idx <= self.current_date_idx:
+            return
+        row = self.stock_data.iloc[idx]
+        previous = self.stock_data.iloc[idx - 1] if idx else None
+        renderer = self.canvas.get_renderer()
+        for axis, items in self._indicator_header_artists.items():
+            if any(item[-1].get_figure() is None for item in items):
+                continue
+            artists = []
+            for label, column, decimals, artist in items:
+                if column is None:
+                    text = label
+                else:
+                    number = row.get(column, np.nan)
+                    last = previous.get(column, np.nan) if previous is not None else np.nan
+                    arrow = ('↑' if number > last else '↓' if number < last else '→') if pd.notna(last) and pd.notna(number) else ''
+                    text = f'{label}:{number:.{decimals}f}{arrow}' if pd.notna(number) else f'{label}:--'
+                artist.set_text(text)
+                artist.set_fontsize(7)
+                artists.append(artist)
+            # Measure rendered glyphs, rather than guessing from character count.
+            # This keeps all six MAs readable at small sizes and fractional DPI.
+            gap = self.fig.dpi * .055
+            width = sum(a.get_window_extent(renderer).width + gap for a in artists)
+            if width > axis.bbox.width * .985:
+                size = max(6, 7 * axis.bbox.width * .985 / width)
+                for artist in artists:
+                    artist.set_fontsize(size)
+            x, y = axis.bbox.width * .005, .985
+            for artist in artists:
+                extent = artist.get_window_extent(renderer)
+                if x + extent.width > axis.bbox.width * .995:
+                    x = axis.bbox.width * .005
+                    y -= (extent.height + 3) / axis.bbox.height
+                artist.set_position((x / axis.bbox.width, y))
+                x += extent.width + gap
+            bottom = min(artist.get_window_extent(renderer).y0 for artist in artists) - 2
+            strip = self._indicator_header_strips[axis]
+            strip.set_y((bottom - axis.bbox.y0) / axis.bbox.height)
+            strip.set_height((axis.bbox.y1 - bottom) / axis.bbox.height)
+
+    def _paint_indicator_headers(self):
+        for axis, items in self._indicator_header_artists.items():
+            if axis.get_visible():
+                strip = self._indicator_header_strips.get(axis)
+                if strip is not None and strip.get_figure() is not None:
+                    axis.draw_artist(strip)
+                for _, _, _, artist in items:
+                    if artist.get_figure() is not None:
+                        axis.draw_artist(artist)
+
+    def _update_market_quote(self, reset=False):
+        if reset or self.stock_data is None or self.current_date_idx < 0:
+            self.lbl_quote_symbol.setText('等待行情')
+            self.lbl_quote_time.setText('--')
+            for value in self.quote_values.values():
+                value.setText('--')
+                value.setStyleSheet('')
+            return
+        # This panel always describes the replay cutoff, never the hovered or future bar.
+        row = self.stock_data.iloc[self.current_date_idx]
+        previous = float(self.stock_data['Close'].iat[self.current_date_idx - 1]) if self.current_date_idx else float(row['Open'])
+        close = float(row['Close'])
+        change = close - previous
+        color = config.UP_COLOR if change > 0 else config.DOWN_COLOR if change < 0 else '#D0D0D0'
+        values = {'close': f'{close:.2f}', 'open': f'{float(row["Open"]):.2f}',
+                  'high': f'{float(row["High"]):.2f}', 'low': f'{float(row["Low"]):.2f}',
+                  'previous': f'{previous:.2f}', 'change': f'{change:+.2f}',
+                  'pct': f'{change / previous * 100:+.2f}%' if previous else '--',
+                  'volume': f'{float(row.get("Volume", 0)):,.0f}'}
+        for key, text in values.items():
+            self.quote_values[key].setText(text)
+            self.quote_values[key].setStyleSheet(f'color: {color if key in ("close", "change", "pct") else "#D0D0D0"};')
+        self.lbl_quote_symbol.setText('【股票隐藏】' if self.cb_hide_stock.isChecked()
+            else f'{self.imported_stock_name} {self.imported_stock_code}')
+        self.lbl_quote_time.setText('【时间隐藏】' if self.cb_hide_date.isChecked()
+            else self.current_datetime.strftime('%Y-%m-%d %H:%M') if self.current_datetime
+            else self.stock_data.index[self.current_date_idx].strftime('%Y-%m-%d %H:%M'))
 
     def _update_status_ui(self, reset: bool = False):
+        self._update_market_quote(reset)
         if reset:
             self.lbl_cur_date.setText("未开始")
             self.lbl_cur_stock.setText("等待载入行情")
@@ -2794,6 +3023,14 @@ class StockDoubleBlindTrainer(DrawingToolsMixin, QMainWindow):
         self.ratio_combo.setEnabled(enabled)
 
     def closeEvent(self, event):
+        self._auto_timer.stop()
+        self._auto_closing = True
+        if self._auto_data_thread is not None and self._auto_data_thread.isRunning():
+            self._auto_closing = True
+            self.cancel_auto_data()
+            self.statusBar().showMessage('正在结束数据准备请求，完成后自动关闭…')
+            event.ignore()
+            return
         self.stop_playback()
         self._save_settings()
         event.accept()

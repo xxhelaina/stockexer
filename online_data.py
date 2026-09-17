@@ -7,6 +7,7 @@
 import json
 import os
 import time
+import multiprocessing
 from typing import Tuple
 
 import pandas as pd
@@ -42,6 +43,8 @@ _HEADERS = {
 def code_to_secid(code: str) -> str:
     """6位股票代码 → 东财 secid（沪市 1.，深市/北交所 0.）"""
     code = str(code).strip()
+    if code.startswith('92'):
+        return f'0.{code}'
     if code.startswith('6') or code.startswith('9'):
         return f'1.{code}'
     return f'0.{code}'
@@ -50,20 +53,20 @@ def code_to_secid(code: str) -> str:
 def code_to_tencent_symbol(code: str) -> str:
     """6位股票代码 → 腾讯/新浪代码（sh600000 / sz000001 / bj920000）"""
     code = str(code).strip()
-    if code.startswith('6') or code.startswith('9'):
-        return f'sh{code}'
     if code.startswith(('4', '8')) or code.startswith('92'):
         return f'bj{code}'
+    if code.startswith('6') or code.startswith('9'):
+        return f'sh{code}'
     return f'sz{code}'
 
 
 def code_to_baostock_symbol(code: str) -> str:
     """6位股票代码 → BaoStock 代码。"""
     code = str(code).strip()
-    if code.startswith(('6', '9')):
-        return f'sh.{code}'
     if code.startswith(('4', '8', '92')):
         return f'bj.{code}'
+    if code.startswith(('6', '9')):
+        return f'sh.{code}'
     return f'sz.{code}'
 
 
@@ -101,7 +104,110 @@ def _request_with_retry(url: str, attempts: int = 4, timeout: int = 10,
 _EM_KLINE_HOSTS = ('push2.eastmoney.com', 'push2his.eastmoney.com')
 
 
-def fetch_kline_baostock(code: str, period_key: str, beg: str, end: str,
+def _baostock_job(connection, kind, args):
+    """Run the blocking SDK in an owned process so a stuck socket is bounded."""
+    try:
+        if kind == 'kline':
+            result = _fetch_kline_baostock_direct(*args)
+        else:
+            import baostock as bs
+            login = bs.login()
+            if login.error_code != '0':
+                raise ConnectionError(login.error_msg)
+            result = {}
+            try:
+                for offset in range(7):
+                    day = (pd.Timestamp(args[0]) - pd.Timedelta(days=offset)).strftime('%Y-%m-%d')
+                    query = bs.query_all_stock(day=day)
+                    if query.error_code != '0':
+                        raise ConnectionError(query.error_msg)
+                    while query.next():
+                        row = dict(zip(query.fields, query.get_row_data()))
+                        symbol = row.get('code', '')
+                        if (symbol.startswith(('sh.6', 'sz.0', 'sz.3', 'bj.4', 'bj.8', 'bj.92'))
+                                and row.get('tradeStatus', '1') == '1'):
+                            result[symbol.split('.')[-1]] = row.get('code_name', symbol)
+                    if result:
+                        break
+            finally:
+                bs.logout()
+        connection.send((True, result))
+    except Exception as error:
+        connection.send((False, str(error)))
+    finally:
+        connection.close()
+
+
+def _bounded_baostock(kind, args, timeout=35):
+    import importlib.util
+    if importlib.util.find_spec('baostock') is None:
+        raise RuntimeError('未安装 baostock')
+    context = multiprocessing.get_context('spawn')
+    reader, writer = context.Pipe(duplex=False)
+    process = context.Process(target=_baostock_job, args=(writer, kind, args), daemon=True)
+    try:
+        process.start()
+        writer.close()
+        if not reader.poll(timeout):
+            raise TimeoutError(f'BaoStock 超过 {timeout} 秒未返回')
+        success, value = reader.recv()
+        if not success:
+            raise ConnectionError(value)
+        return value
+    finally:
+        reader.close()
+        writer.close()
+        if process.pid is not None:
+            process.join(.2)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+
+
+def fetch_stock_universe(day):
+    """Prefer historical candidates; use the current EM list as a fallback.
+
+    EM parameters follow AKShare's stock_zh_a_spot_em upstream implementation:
+    https://github.com/akfamily/akshare/blob/master/akshare/stock_feature/stock_hist_em.py
+    Current-list fallback cannot restore delisted historical candidates.
+    """
+    try:
+        stocks = _bounded_baostock('universe', (day,))
+        if stocks:
+            return stocks
+    except Exception as error:
+        logger.warning(f'BaoStock 股票列表不可用，尝试东方财富：{error}')
+    stocks = {}
+    page = 1
+    while page <= 100:
+        params = {'pn': page, 'pz': 100, 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2, 'fid': 'f12',
+                  'ut': 'bd1d9ddb04089700cf9c27f6f7426281',
+                  'fs': 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048', 'fields': 'f12,f14'}
+        url = 'https://82.push2.eastmoney.com/api/qt/clist/get?' + requests.compat.urlencode(params)
+        data = _request_with_retry(url, attempts=2, timeout=8).json().get('data') or {}
+        rows = data.get('diff') or []
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        if not rows:
+            raise ValueError('东方财富股票列表为空或分页不完整')
+        previous_count = len(stocks)
+        for row in rows:
+            code = str(row.get('f12', ''))
+            if len(code) == 6 and code.isdigit():
+                stocks[code] = row.get('f14') or code
+        if len(stocks) >= int(data.get('total', len(stocks))):
+            return stocks
+        if len(stocks) == previous_count:
+            raise ValueError('东方财富股票列表重复分页，无法完成检索')
+        page += 1
+    raise ValueError('股票列表超过分页上限')
+
+
+def fetch_kline_baostock(code, period_key, beg, end, fqt=1):
+    return _bounded_baostock('kline', (code, period_key, beg, end, fqt))
+
+
+def _fetch_kline_baostock_direct(code: str, period_key: str, beg: str, end: str,
                          fqt: int = 1) -> Tuple[pd.DataFrame, str]:
     """通过可选 BaoStock 包获取长区间历史行情。"""
     if period_key not in BAOSTOCK_PERIODS:
@@ -307,7 +413,7 @@ def fetch_kline_sina(code: str, period_key: str) -> Tuple[pd.DataFrame, str]:
 
 
 def download_kline(code: str, period_key: str, beg: str, end: str,
-                   fqt: int = 1) -> Tuple[pd.DataFrame, str, str]:
+                   fqt: int = 1, required_range=None) -> Tuple[pd.DataFrame, str, str]:
     """统一下载入口：东财主源，失败依次走新浪、腾讯兜底。
 
     返回 (df, 股票名称, 数据来源)。成功后保存 CSV 到 下载数据/ 目录供离线复用。
@@ -320,34 +426,29 @@ def download_kline(code: str, period_key: str, beg: str, end: str,
 
     errors = []
     df = name = source = None
+    providers = []
     if period_key in BAOSTOCK_PERIODS:
+        providers.append(('BaoStock', lambda: fetch_kline_baostock(code, period_key, beg, end, fqt)))
+    providers.extend([
+        ('东方财富', lambda: fetch_kline_eastmoney(code, period_key, beg, end, fqt)),
+        ('新浪（兜底）', lambda: fetch_kline_sina(code, period_key)),
+        ('腾讯（兜底）', lambda: fetch_kline_tencent(code, period_key))])
+    for provider, fetch in providers:
         try:
-            df, name = fetch_kline_baostock(code, period_key, beg, end, fqt)
-            source = 'BaoStock'
+            candidate, candidate_name = fetch()
+            if candidate is None or candidate.empty:
+                raise ValueError('返回行情为空')
+            if required_range is not None:
+                from training_data import range_covered
+                if not range_covered(candidate, *required_range, period_key):
+                    raise ValueError(f'未覆盖所选区间，实际 {candidate.index[0]} ~ {candidate.index[-1]}')
+            df, name, source = candidate, candidate_name, provider
+            break
         except Exception as e:
-            errors.append(f'BaoStock: {e}')
-            logger.warning(f'BaoStock 不可用，切换东方财富：{e}')
+            errors.append(f'{provider}: {e}')
+            logger.warning(f'{provider} 不可用或范围不足，尝试下一源：{e}')
     if df is None:
-        try:
-            df, name = fetch_kline_eastmoney(code, period_key, beg, end, fqt)
-            source = '东方财富'
-        except Exception as e:
-            errors.append(f'东方财富: {e}')
-            logger.warning(f'东方财富不可用，切换新浪：{e}')
-    if df is None:
-        try:
-            df, name = fetch_kline_sina(code, period_key)
-            source = '新浪（兜底）'
-        except Exception as e:
-            errors.append(f'新浪: {e}')
-            logger.warning(f'新浪不可用，切换腾讯：{e}')
-    if df is None:
-        try:
-            df, name = fetch_kline_tencent(code, period_key)
-            source = '腾讯（兜底）'
-        except Exception as e:
-            errors.append(f'腾讯: {e}')
-            raise ConnectionError('所有免费数据源均不可用：\n' + '\n'.join(errors)) from e
+        raise ConnectionError('所有免费数据源均不可用或无法覆盖所选区间：\n' + '\n'.join(errors))
 
     # 部分兜底接口只返回最近 N 根，仍严格按用户区间过滤，避免界面显示错误范围。
     begin_ts = pd.Timestamp(beg).normalize()
@@ -362,11 +463,19 @@ def download_kline(code: str, period_key: str, beg: str, end: str,
     if df is None or df.empty:
         raise ValueError(f'下载结果为空（代码 {code}，周期 {period_key}）')
 
-    # 保存 CSV 供离线复用
+    # Range-specific caches preserve older downloads instead of overwriting
+    # longer history with a short request. Do not merge different adjustment or
+    # provider conventions blindly.
     try:
         out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '下载数据')
         os.makedirs(out_dir, exist_ok=True)
-        out_file = os.path.join(out_dir, f'{code}_{period_key}.csv')
+        begin_label = pd.Timestamp(beg).strftime('%Y%m%d')
+        end_label = pd.Timestamp(end).strftime('%Y%m%d')
+        provider_label = ('bs' if source == 'BaoStock' else 'em' if source == '东方财富'
+                          else 'sina' if source.startswith('新浪') else 'tencent')
+        out_file = os.path.join(out_dir, f'{code}_{period_key}_{begin_label}_{end_label}_fqt{fqt}_{provider_label}.csv')
+        if os.path.exists(out_file):
+            out_file = os.path.splitext(out_file)[0] + f'_v{time.time_ns()}.csv'
         df.to_csv(out_file, encoding='utf-8-sig')
         logger.info(f'已保存 {out_file}（{len(df)} 条）')
     except Exception as e:
